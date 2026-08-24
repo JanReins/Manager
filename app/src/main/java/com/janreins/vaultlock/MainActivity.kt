@@ -17,16 +17,24 @@ import com.janreins.vaultlock.ui.theme.VaultLockTheme
 
 class MainActivity : FragmentActivity() {
 
+    // ============================================================
+    // SECURITY TOGGLE – set to true after AI Studio testing is finished
+    // ============================================================
+    private val ENABLE_FLAG_SECURE = false
+    // ============================================================
+
     private val viewModel: VaultViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Mandatory security: prevent screenshots and recents screen previews
-        window.setFlags(
-            WindowManager.LayoutParams.FLAG_SECURE,
-            WindowManager.LayoutParams.FLAG_SECURE
-        )
+        // Mandatory security: prevent screenshots and recents screen previews (toggleable for testing)
+        if (ENABLE_FLAG_SECURE) {
+            window.setFlags(
+                WindowManager.LayoutParams.FLAG_SECURE,
+                WindowManager.LayoutParams.FLAG_SECURE
+            )
+        }
 
         enableEdgeToEdge()
 
