@@ -10,11 +10,11 @@ plugins {
 }
 
 android {
-  namespace = "com.example"
+  namespace = "com.janreins.vaultlock"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
   defaultConfig {
-    applicationId = "com.aistudio.vaultlock.secvlt"
+    applicationId = "com.janreins.vaultlock"
     minSdk = 26
     targetSdk = 36
     versionCode = 1
