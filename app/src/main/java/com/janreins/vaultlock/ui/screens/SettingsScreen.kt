@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.fragment.app.FragmentActivity
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -91,6 +92,7 @@ fun SettingsScreen(
     onWipeApp: () -> Unit
 ) {
     val context = LocalContext.current
+    val activity = context as? FragmentActivity
     val coroutineScope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -256,10 +258,10 @@ fun SettingsScreen(
                             Switch(
                                 checked = uiState.isBiometricEnabled,
                                 onCheckedChange = { enabled ->
-                                    viewModel.setBiometricEnabled(enabled) { success ->
-                                        if (!success) {
+                                    viewModel.setBiometricEnabled(enabled, activity) { success, msg ->
+                                        if (!success && msg.isNotBlank()) {
                                             coroutineScope.launch {
-                                                snackbarHostState.showSnackbar("Failed to update biometric setting")
+                                                snackbarHostState.showSnackbar(msg)
                                             }
                                         }
                                     }
@@ -383,7 +385,7 @@ fun SettingsScreen(
             ChangeMasterPasswordDialog(
                 onDismiss = { showChangePasswordDialog = false },
                 onChange = { currentPass, newPass, confirmPass, onResult ->
-                    viewModel.changeMasterPassword(currentPass, newPass, confirmPass) { success, msg ->
+                    viewModel.changeMasterPassword(currentPass, newPass, confirmPass, activity) { success, msg ->
                         onResult(success, msg)
                         if (success) {
                             coroutineScope.launch {

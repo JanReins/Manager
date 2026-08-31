@@ -3,15 +3,64 @@ package com.janreins.vaultlock.data
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Base64
-import com.janreins.vaultlock.crypto.BiometricHelper
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
 import com.janreins.vaultlock.crypto.CryptoManager
 import javax.crypto.SecretKey
 
+/**
+ * Security preferences stored in Android Keystore backed EncryptedSharedPreferences.
+ * Stores encryption salt, authentication verifier token, wrapped master keys, and app flags.
+ */
 class SecurityPreferences(context: Context) {
-    private val prefs: SharedPreferences =
-        context.getSharedPreferences("vaultlock_security_prefs", Context.MODE_PRIVATE)
+
+    private val prefs: SharedPreferences
+
+    init {
+        // Initialize MasterKey for AES-256-GCM Keystore-backed encryption of preferences
+        val masterKey = MasterKey.Builder(context.applicationContext)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .build()
+
+        prefs = EncryptedSharedPreferences.create(
+            context.applicationContext,
+            ENCRYPTED_PREFS_FILE,
+            masterKey,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        )
+
+        // Seamless one-time migration from legacy plain SharedPreferences if present
+        migrateLegacyPlainPrefsIfPresent(context)
+    }
+
+    private fun migrateLegacyPlainPrefsIfPresent(context: Context) {
+        try {
+            val legacyPrefs = context.getSharedPreferences(LEGACY_PREFS_FILE, Context.MODE_PRIVATE)
+            if (legacyPrefs.contains(KEY_IS_SETUP) && !prefs.contains(KEY_IS_SETUP)) {
+                val editor = prefs.edit()
+                legacyPrefs.all.forEach { (key, value) ->
+                    when (value) {
+                        is Boolean -> editor.putBoolean(key, value)
+                        is String -> editor.putString(key, value)
+                        is Long -> editor.putLong(key, value)
+                        is Int -> editor.putInt(key, value)
+                        is Float -> editor.putFloat(key, value)
+                    }
+                }
+                editor.apply()
+                // Clear plain legacy preferences file for security
+                legacyPrefs.edit().clear().apply()
+            }
+        } catch (_: Exception) {
+            // Ignore migration failure and proceed
+        }
+    }
 
     companion object {
+        private const val ENCRYPTED_PREFS_FILE = "vaultlock_security_encrypted_prefs"
+        private const val LEGACY_PREFS_FILE = "vaultlock_security_prefs"
+
         private const val KEY_IS_SETUP = "key_is_setup"
         private const val KEY_SALT = "key_master_salt"
         private const val KEY_VERIFIER = "key_auth_verifier"
@@ -35,41 +84,28 @@ class SecurityPreferences(context: Context) {
         get() = prefs.getString(KEY_THEME_MODE, "dark") ?: "dark"
 
     /**
-     * Initializes the Master Password for the first time.
-     * Generates a unique 32-byte salt, derives the Master Key via PBKDF2,
-     * encrypts the magic verification token, and optionally enables biometric.
+     * Initializes the Master Password for the first time or updates it.
+     * Generates a unique 32-byte salt, derives the Master Key via PBKDF2 (150,000 iterations),
+     * and stores the encrypted magic verification token in EncryptedSharedPreferences.
      */
-    fun setupMasterPassword(password: CharArray, enableBiometric: Boolean = false): SecretKey {
+    fun setupMasterPassword(password: CharArray): SecretKey {
         val salt = CryptoManager.generateSalt()
         val derivedKey = CryptoManager.deriveKey(password, salt)
         val verifierEncrypted = CryptoManager.encrypt(VERIFIER_MAGIC, derivedKey)
         val saltBase64 = Base64.encodeToString(salt, Base64.NO_WRAP)
 
-        val editor = prefs.edit()
+        prefs.edit()
             .putBoolean(KEY_IS_SETUP, true)
             .putString(KEY_SALT, saltBase64)
             .putString(KEY_VERIFIER, verifierEncrypted)
-            .putLong(KEY_AUTO_LOCK_SECONDS, 120L)
+            .putLong(KEY_AUTO_LOCK_SECONDS, prefs.getLong(KEY_AUTO_LOCK_SECONDS, 120L))
+            .apply()
 
-        if (enableBiometric) {
-            try {
-                val wrapped = BiometricHelper.wrapMasterKey(derivedKey)
-                editor.putBoolean(KEY_BIOMETRIC_ENABLED, true)
-                editor.putString(KEY_WRAPPED_KEY, wrapped)
-            } catch (e: Exception) {
-                editor.putBoolean(KEY_BIOMETRIC_ENABLED, false)
-            }
-        } else {
-            editor.putBoolean(KEY_BIOMETRIC_ENABLED, false)
-            editor.remove(KEY_WRAPPED_KEY)
-        }
-
-        editor.apply()
         return derivedKey
     }
 
     /**
-     * Verifies the user entered Master Password.
+     * Verifies the user entered Master Password against the stored verifier payload.
      * Returns the derived SecretKey if valid, or null if incorrect.
      */
     fun verifyAndDeriveKey(password: CharArray): SecretKey? {
@@ -86,54 +122,37 @@ class SecurityPreferences(context: Context) {
             } else {
                 null
             }
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             null
         }
     }
 
     /**
-     * Attempts to unlock using Keystore-wrapped biometric token.
+     * Returns the wrapped master key string if biometric unlock is enabled.
      */
-    fun unlockWithBiometric(): SecretKey? {
+    fun getWrappedMasterKey(): String? {
         if (!isBiometricEnabled) return null
-        val wrappedKey = prefs.getString(KEY_WRAPPED_KEY, null) ?: return null
-        return try {
-            val unwrappedKey = BiometricHelper.unwrapMasterKey(wrappedKey)
-            val verifierEncrypted = prefs.getString(KEY_VERIFIER, null) ?: return null
-            val decrypted = CryptoManager.decrypt(verifierEncrypted, unwrappedKey)
-            if (decrypted == VERIFIER_MAGIC) {
-                unwrappedKey
-            } else {
-                null
-            }
-        } catch (e: Exception) {
-            null
-        }
+        return prefs.getString(KEY_WRAPPED_KEY, null)
     }
 
-    fun setBiometricEnabled(enabled: Boolean, currentKey: SecretKey?): Boolean {
-        return if (enabled) {
-            if (currentKey == null) {
-                false
-            } else {
-                try {
-                    val wrapped = BiometricHelper.wrapMasterKey(currentKey)
-                    prefs.edit()
-                        .putBoolean(KEY_BIOMETRIC_ENABLED, true)
-                        .putString(KEY_WRAPPED_KEY, wrapped)
-                        .apply()
-                    true
-                } catch (e: Exception) {
-                    false
-                }
-            }
-        } else {
-            prefs.edit()
-                .putBoolean(KEY_BIOMETRIC_ENABLED, false)
-                .remove(KEY_WRAPPED_KEY)
-                .apply()
-            true
-        }
+    /**
+     * Saves the Keystore-wrapped master key token.
+     */
+    fun saveBiometricWrappedKey(wrappedKeyBase64: String) {
+        prefs.edit()
+            .putBoolean(KEY_BIOMETRIC_ENABLED, true)
+            .putString(KEY_WRAPPED_KEY, wrappedKeyBase64)
+            .apply()
+    }
+
+    /**
+     * Disables biometric unlock and purges the stored wrapped key.
+     */
+    fun disableBiometric() {
+        prefs.edit()
+            .putBoolean(KEY_BIOMETRIC_ENABLED, false)
+            .remove(KEY_WRAPPED_KEY)
+            .apply()
     }
 
     fun setAutoLockSeconds(seconds: Long) {

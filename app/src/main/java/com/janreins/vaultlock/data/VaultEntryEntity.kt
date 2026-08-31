@@ -5,16 +5,17 @@ import androidx.room.Entity
 import androidx.room.PrimaryKey
 
 /**
- * Room entity representing an item stored in the SQLite database.
- * Crucial fields (username, password, url, notes) are stored as AES-256-GCM encrypted Base64 strings.
+ * Room entity representing an item stored in SQLite database.
+ * All sensitive fields (title, username, password, url, notes) are stored
+ * strictly as AES-256-GCM encrypted Base64 strings.
  */
 @Entity(tableName = "vault_entries")
 data class VaultEntryEntity(
     @PrimaryKey(autoGenerate = true)
     val id: Long = 0,
 
-    @ColumnInfo(name = "title")
-    val title: String,
+    @ColumnInfo(name = "encrypted_title")
+    val encryptedTitle: String,
 
     @ColumnInfo(name = "encrypted_username")
     val encryptedUsername: String,

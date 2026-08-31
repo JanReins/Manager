@@ -2,11 +2,13 @@ package com.janreins.vaultlock.ui
 
 import android.app.Application
 import android.content.ClipData
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PersistableBundle
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -19,17 +21,14 @@ import com.janreins.vaultlock.data.VaultEntry
 import com.janreins.vaultlock.data.VaultRepository
 import com.janreins.vaultlock.generator.GeneratorOptions
 import com.janreins.vaultlock.generator.PasswordGenerator
-import com.janreins.vaultlock.generator.PasswordStrength
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import javax.crypto.SecretKey
 
 data class VaultUiState(
     val isMasterPasswordSet: Boolean = false,
@@ -69,7 +68,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     val uiState: StateFlow<VaultUiState> = _uiState.asStateFlow()
 
     private var autoLockJob: Job? = null
-    private var clipboardClearHandler = Handler(Looper.getMainLooper())
+    private val clipboardClearHandler = Handler(Looper.getMainLooper())
     private var clipboardClearRunnable: Runnable? = null
 
     init {
@@ -154,10 +153,11 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         autoLockJob = null
     }
 
+    /**
+     * Locks the vault immediately when the application is sent to the background.
+     */
     fun onAppBackgrounded() {
-        if (_uiState.value.autoLockSeconds == 0L) {
-            lockVault()
-        }
+        lockVault()
     }
 
     fun onAppForegrounded() {
@@ -172,29 +172,59 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun setupMasterPassword(password: String, enableBiometric: Boolean, onComplete: (Boolean, String) -> Unit) {
+    /**
+     * Initializes the Master Password for the first time.
+     */
+    fun setupMasterPassword(
+        password: String,
+        enableBiometric: Boolean,
+        activity: FragmentActivity? = null,
+        onComplete: (Boolean, String) -> Unit
+    ) {
         if (password.length < 8) {
             onComplete(false, "Password must be at least 8 characters long")
             return
         }
         viewModelScope.launch {
             try {
-                val derivedKey = securityPreferences.setupMasterPassword(password.toCharArray(), enableBiometric)
+                val derivedKey = securityPreferences.setupMasterPassword(password.toCharArray())
                 SessionManager.setKey(derivedKey)
                 _uiState.update {
                     it.copy(
                         isMasterPasswordSet = true,
-                        isUnlocked = true,
-                        isBiometricEnabled = securityPreferences.isBiometricEnabled
+                        isUnlocked = true
                     )
                 }
-                onComplete(true, "Master Password created successfully")
+
+                if (enableBiometric && activity != null && BiometricHelper.isBiometricAvailable(activity)) {
+                    BiometricHelper.promptBiometricEnrollment(
+                        activity = activity,
+                        masterKeyToWrap = derivedKey,
+                        onEnrolled = { wrappedKey ->
+                            securityPreferences.saveBiometricWrappedKey(wrappedKey)
+                            _uiState.update { it.copy(isBiometricEnabled = true) }
+                            onComplete(true, "Master Password created and biometric unlock registered")
+                        },
+                        onError = { error ->
+                            securityPreferences.disableBiometric()
+                            _uiState.update { it.copy(isBiometricEnabled = false) }
+                            onComplete(true, "Master Password created (Biometric registration skipped: $error)")
+                        }
+                    )
+                } else {
+                    securityPreferences.disableBiometric()
+                    _uiState.update { it.copy(isBiometricEnabled = false) }
+                    onComplete(true, "Master Password created successfully")
+                }
             } catch (e: Exception) {
                 onComplete(false, "Setup failed: ${e.localizedMessage}")
             }
         }
     }
 
+    /**
+     * Unlocks the vault by verifying the master password and deriving the session key.
+     */
     fun unlockWithPassword(password: String, onResult: (Boolean, String) -> Unit) {
         viewModelScope.launch {
             try {
@@ -212,23 +242,29 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * Unlocks the vault using hardware-authenticated biometric authentication.
+     * The master key is unwrapped atomically inside the CryptoObject callback.
+     */
     fun unlockWithBiometric(activity: FragmentActivity, onResult: (Boolean, String) -> Unit) {
         if (!_uiState.value.isBiometricEnabled) {
             onResult(false, "Biometric unlock not enabled")
             return
         }
 
-        BiometricHelper.promptBiometric(
+        val wrappedKey = securityPreferences.getWrappedMasterKey()
+        if (wrappedKey == null) {
+            onResult(false, "Biometric credentials missing. Please unlock with master password.")
+            return
+        }
+
+        BiometricHelper.promptBiometricUnlock(
             activity = activity,
-            onSuccess = {
-                val key = securityPreferences.unlockWithBiometric()
-                if (key != null) {
-                    SessionManager.setKey(key)
-                    _uiState.update { it.copy(isUnlocked = true, errorMessage = null) }
-                    onResult(true, "Unlocked via Biometrics")
-                } else {
-                    onResult(false, "Biometric verification failed to decrypt master key")
-                }
+            wrappedKeyBase64 = wrappedKey,
+            onSuccess = { secretKey ->
+                SessionManager.setKey(secretKey)
+                _uiState.update { it.copy(isUnlocked = true, errorMessage = null) }
+                onResult(true, "Unlocked via Biometrics")
             },
             onError = { error ->
                 if (error != "cancelled") {
@@ -238,6 +274,9 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
+    /**
+     * Explicitly locks the vault session and wipes key material from memory.
+     */
     fun lockVault() {
         SessionManager.lock()
         _uiState.update { it.copy(isUnlocked = false) }
@@ -285,6 +324,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         currentPass: String,
         newPass: String,
         confirmPass: String,
+        activity: FragmentActivity? = null,
         onResult: (Boolean, String) -> Unit
     ) {
         if (newPass != confirmPass) {
@@ -304,26 +344,59 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                     return@launch
                 }
 
-                val newKey = securityPreferences.setupMasterPassword(
-                    newPass.toCharArray(),
-                    securityPreferences.isBiometricEnabled
-                )
+                val newKey = securityPreferences.setupMasterPassword(newPass.toCharArray())
                 repository.reEncryptAll(oldKey, newKey)
                 SessionManager.setKey(newKey)
-                onResult(true, "Master Password changed & vault re-encrypted")
+
+                // Re-enroll biometric if it was active
+                if (securityPreferences.isBiometricEnabled && activity != null) {
+                    BiometricHelper.promptBiometricEnrollment(
+                        activity = activity,
+                        masterKeyToWrap = newKey,
+                        onEnrolled = { wrappedKey ->
+                            securityPreferences.saveBiometricWrappedKey(wrappedKey)
+                            onResult(true, "Master Password changed & biometric updated")
+                        },
+                        onError = {
+                            securityPreferences.disableBiometric()
+                            _uiState.update { it.copy(isBiometricEnabled = false) }
+                            onResult(true, "Master Password changed (Biometric reset required)")
+                        }
+                    )
+                } else {
+                    onResult(true, "Master Password changed & vault re-encrypted")
+                }
             } catch (e: Exception) {
                 onResult(false, "Failed to change password: ${e.message}")
             }
         }
     }
 
-    fun setBiometricEnabled(enabled: Boolean, onResult: (Boolean) -> Unit) {
-        val currentKey = if (SessionManager.hasKey()) SessionManager.getKey() else null
-        val success = securityPreferences.setBiometricEnabled(enabled, currentKey)
-        if (success) {
-            _uiState.update { it.copy(isBiometricEnabled = enabled) }
+    fun setBiometricEnabled(enabled: Boolean, activity: FragmentActivity?, onResult: (Boolean, String) -> Unit) {
+        if (enabled) {
+            val currentKey = if (SessionManager.hasKey()) SessionManager.getKey() else null
+            if (currentKey == null || activity == null) {
+                onResult(false, "Active unlocked session required to enable biometrics")
+                return
+            }
+            BiometricHelper.promptBiometricEnrollment(
+                activity = activity,
+                masterKeyToWrap = currentKey,
+                onEnrolled = { wrappedKey ->
+                    securityPreferences.saveBiometricWrappedKey(wrappedKey)
+                    _uiState.update { it.copy(isBiometricEnabled = true) }
+                    onResult(true, "Biometric unlock enabled")
+                },
+                onError = { error ->
+                    onResult(false, error)
+                }
+            )
+        } else {
+            securityPreferences.disableBiometric()
+            BiometricHelper.deleteKeystoreKey()
+            _uiState.update { it.copy(isBiometricEnabled = false) }
+            onResult(true, "Biometric unlock disabled")
         }
-        onResult(success)
     }
 
     fun setAutoLockDuration(seconds: Long) {
@@ -351,14 +424,17 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(currentGeneratedPassword = newPassword) }
     }
 
+    /**
+     * Copies sensitive text to clipboard with sensitive masking flag and 30s auto-clear.
+     */
     fun copyToClipboard(context: Context, text: String, label: String = "VaultLock Data") {
         try {
             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             val clip = ClipData.newPlainText(label, text)
             // Mark sensitive for Android 13+ clipboard preview masking
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                clip.description.extras = android.os.PersistableBundle().apply {
-                    putBoolean("android.content.extra.IS_SENSITIVE", true)
+                clip.description.extras = PersistableBundle().apply {
+                    putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
                 }
             }
             clipboard.setPrimaryClip(clip)
@@ -373,8 +449,8 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                     if (currentClip != null && currentClip.itemCount > 0 && currentClip.getItemAt(0).text == text) {
                         clipboard.setPrimaryClip(ClipData.newPlainText("", ""))
                     }
-                } catch (e: Exception) {
-                    // Ignore
+                } catch (_: Exception) {
+                    // Ignore clipboard error
                 }
                 _uiState.update { it.copy(activeCopiedLabel = null) }
             }
@@ -388,7 +464,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                     _uiState.update { it.copy(activeCopiedLabel = null) }
                 }
             }
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             // Fallback
         }
     }
@@ -398,7 +474,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val payload = repository.createEncryptedBackupPayload()
                 onReady(payload)
-            } catch (e: Exception) {
+            } catch (_: Exception) {
                 onReady(null)
             }
         }
@@ -409,7 +485,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val restoredCount = repository.restoreEncryptedBackupPayload(encryptedBytes)
                 onComplete(true, restoredCount, "Successfully restored $restoredCount entries")
-            } catch (e: Exception) {
+            } catch (_: Exception) {
                 onComplete(false, 0, "Failed to restore backup: Invalid password or corrupted file")
             }
         }
@@ -418,6 +494,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     fun wipeAllData(onComplete: () -> Unit) {
         viewModelScope.launch {
             repository.wipeEverything()
+            BiometricHelper.deleteKeystoreKey()
             _uiState.update {
                 VaultUiState(
                     isMasterPasswordSet = false,

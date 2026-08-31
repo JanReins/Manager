@@ -237,7 +237,7 @@ fun UnlockScreen(
                                             errorMessage = "Passwords do not match"
                                         } else {
                                             isProcessing = true
-                                            viewModel.setupMasterPassword(passwordInput, enableBiometricCheckbox) { success, msg ->
+                                            viewModel.setupMasterPassword(passwordInput, enableBiometricCheckbox, activity) { success, msg ->
                                                 isProcessing = false
                                                 if (!success) errorMessage = msg
                                             }
@@ -288,7 +288,7 @@ fun UnlockScreen(
                                         errorMessage = "Passwords do not match"
                                     } else {
                                         isProcessing = true
-                                        viewModel.setupMasterPassword(passwordInput, enableBiometricCheckbox) { success, msg ->
+                                        viewModel.setupMasterPassword(passwordInput, enableBiometricCheckbox, activity) { success, msg ->
                                             isProcessing = false
                                             if (!success) errorMessage = msg
                                         }

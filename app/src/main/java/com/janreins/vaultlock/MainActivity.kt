@@ -18,9 +18,9 @@ import com.janreins.vaultlock.ui.theme.VaultLockTheme
 class MainActivity : FragmentActivity() {
 
     // ============================================================
-    // SECURITY TOGGLE – set to true after AI Studio testing is finished
+    // SECURITY TOGGLE – FLAG_SECURE is ON by default for maximum security
     // ============================================================
-    private val ENABLE_FLAG_SECURE = false
+    private val ENABLE_FLAG_SECURE = true
     // ============================================================
 
     private val viewModel: VaultViewModel by viewModels()
@@ -28,7 +28,7 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Mandatory security: prevent screenshots and recents screen previews (toggleable for testing)
+        // Mandatory security: prevent screenshots and recents screen previews
         if (ENABLE_FLAG_SECURE) {
             window.setFlags(
                 WindowManager.LayoutParams.FLAG_SECURE,
@@ -63,6 +63,7 @@ class MainActivity : FragmentActivity() {
 
     override fun onStop() {
         super.onStop()
+        // Lock the vault immediately when backgrounded
         viewModel.onAppBackgrounded()
     }
 

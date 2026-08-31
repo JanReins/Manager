@@ -15,7 +15,7 @@ class VaultRepository(
     private val securityPreferences: SecurityPreferences
 ) {
     /**
-     * Decrypts database entities into domain models in real-time.
+     * Decrypts database entities into domain models in real-time when the vault session is unlocked.
      */
     fun getAllEntries(): Flow<List<VaultEntry>> {
         return vaultDao.getAllEntriesFlow().map { entities ->
@@ -133,7 +133,7 @@ class VaultRepository(
         if (key == null) {
             return VaultEntry(
                 id = id,
-                title = title,
+                title = "••••",
                 username = "••••",
                 password = "••••",
                 url = "",
@@ -148,7 +148,7 @@ class VaultRepository(
         return try {
             VaultEntry(
                 id = id,
-                title = title,
+                title = CryptoManager.decrypt(encryptedTitle, key),
                 username = CryptoManager.decrypt(encryptedUsername, key),
                 password = CryptoManager.decrypt(encryptedPassword, key),
                 url = CryptoManager.decrypt(encryptedUrl, key),
@@ -158,11 +158,11 @@ class VaultRepository(
                 createdAt = createdAt,
                 updatedAt = updatedAt
             )
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             VaultEntry(
                 id = id,
-                title = title,
-                username = "[Decryption Failed]",
+                title = "[Decryption Failed]",
+                username = "",
                 password = "",
                 url = "",
                 notes = "",
@@ -177,7 +177,7 @@ class VaultRepository(
     private fun VaultEntry.toEntity(key: SecretKey): VaultEntryEntity {
         return VaultEntryEntity(
             id = id,
-            title = title.trim(),
+            encryptedTitle = CryptoManager.encrypt(title.trim(), key),
             encryptedUsername = CryptoManager.encrypt(username, key),
             encryptedPassword = CryptoManager.encrypt(password, key),
             encryptedUrl = CryptoManager.encrypt(url.trim(), key),

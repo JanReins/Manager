@@ -1,6 +1,7 @@
 package com.janreins.vaultlock.crypto
 
 import android.content.Context
+import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
@@ -16,21 +17,21 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 /**
- * Biometric authentication & Keystore integration.
- * Securely stores the derived Master Key wrapped inside Android Keystore
- * so users can quickly unlock via fingerprint/face.
+ * Biometric authentication & Android Keystore integration.
+ * Securely wraps the derived Master Key inside hardware-backed Android Keystore
+ * with setUserAuthenticationRequired(true) and BIOMETRIC_STRONG only.
+ * The Master Key is unwrapped exclusively via a hardware-authenticated CryptoObject.
  */
 object BiometricHelper {
     private const val ANDROID_KEYSTORE = "AndroidKeyStore"
     private const val KEYSTORE_ALIAS = "VaultLockBiometricWrapperKey"
     private const val GCM_IV_LENGTH = 12
     private const val GCM_TAG_LENGTH = 128
+    private const val AES_GCM_CIPHER = "AES/GCM/NoPadding"
 
     fun isBiometricAvailable(context: Context): Boolean {
         val biometricManager = BiometricManager.from(context)
-        val authenticators = BiometricManager.Authenticators.BIOMETRIC_STRONG or
-                BiometricManager.Authenticators.BIOMETRIC_WEAK
-        return biometricManager.canAuthenticate(authenticators) == BiometricManager.BIOMETRIC_SUCCESS
+        return biometricManager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG) == BiometricManager.BIOMETRIC_SUCCESS
     }
 
     private fun getOrCreateKeystoreKey(): SecretKey {
@@ -40,102 +41,198 @@ object BiometricHelper {
                 KeyProperties.KEY_ALGORITHM_AES,
                 ANDROID_KEYSTORE
             )
-            val spec = KeyGenParameterSpec.Builder(
+            val builder = KeyGenParameterSpec.Builder(
                 KEYSTORE_ALIAS,
                 KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
             )
                 .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
                 .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
                 .setKeySize(256)
-                .build()
-            keyGenerator.init(spec)
+                .setUserAuthenticationRequired(true)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                builder.setUserAuthenticationParameters(0, KeyProperties.AUTH_BIOMETRIC_STRONG)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                builder.setInvalidatedByBiometricEnrollment(true)
+            }
+
+            keyGenerator.init(builder.build())
             keyGenerator.generateKey()
         }
         return (keyStore.getEntry(KEYSTORE_ALIAS, null) as KeyStore.SecretKeyEntry).secretKey
     }
 
-    fun wrapMasterKey(masterKey: SecretKey): String {
-        val keystoreKey = getOrCreateKeystoreKey()
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, keystoreKey)
-        val iv = cipher.iv
-        val encryptedKeyBytes = cipher.doFinal(masterKey.encoded)
-
-        val combined = ByteArray(iv.size + encryptedKeyBytes.size)
-        System.arraycopy(iv, 0, combined, 0, iv.size)
-        System.arraycopy(encryptedKeyBytes, 0, combined, iv.size, encryptedKeyBytes.size)
-        return Base64.encodeToString(combined, Base64.NO_WRAP)
-    }
-
-    fun unwrapMasterKey(wrappedKeyBase64: String): SecretKey {
-        val keystoreKey = getOrCreateKeystoreKey()
-        val combined = Base64.decode(wrappedKeyBase64, Base64.NO_WRAP)
-        if (combined.size < GCM_IV_LENGTH) {
-            throw IllegalArgumentException("Invalid wrapped key size")
+    fun deleteKeystoreKey() {
+        try {
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            if (keyStore.containsAlias(KEYSTORE_ALIAS)) {
+                keyStore.deleteEntry(KEYSTORE_ALIAS)
+            }
+        } catch (_: Exception) {
+            // Ignore keystore deletion failure
         }
-
-        val iv = ByteArray(GCM_IV_LENGTH)
-        System.arraycopy(combined, 0, iv, 0, GCM_IV_LENGTH)
-
-        val cipherTextSize = combined.size - GCM_IV_LENGTH
-        val cipherText = ByteArray(cipherTextSize)
-        System.arraycopy(combined, GCM_IV_LENGTH, cipherText, 0, cipherTextSize)
-
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        val spec = GCMParameterSpec(GCM_TAG_LENGTH, iv)
-        cipher.init(Cipher.DECRYPT_MODE, keystoreKey, spec)
-
-        val decryptedKeyBytes = cipher.doFinal(cipherText)
-        return SecretKeySpec(decryptedKeyBytes, "AES")
     }
 
-    fun promptBiometric(
+    /**
+     * Enrolls biometric authentication by encrypting the master key using a Keystore key
+     * authenticated via BiometricPrompt.CryptoObject.
+     */
+    fun promptBiometricEnrollment(
         activity: FragmentActivity,
-        title: String = "Unlock VaultLock",
-        subtitle: String = "Verify your identity with biometrics",
-        negativeButtonText: String = "Use Master Password",
-        onSuccess: () -> Unit,
+        masterKeyToWrap: SecretKey,
+        title: String = "Enable Biometric Unlock",
+        subtitle: String = "Authenticate to securely register biometric unlock",
+        negativeButtonText: String = "Cancel",
+        onEnrolled: (String) -> Unit,
         onError: (String) -> Unit
     ) {
-        val executor = ContextCompat.getMainExecutor(activity)
-        val prompt = BiometricPrompt(
-            activity,
-            executor,
-            object : BiometricPrompt.AuthenticationCallback() {
-                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                    super.onAuthenticationSucceeded(result)
-                    onSuccess()
-                }
+        try {
+            // Delete previous key if any to ensure fresh generation
+            deleteKeystoreKey()
+            val keystoreKey = getOrCreateKeystoreKey()
+            val cipher = Cipher.getInstance(AES_GCM_CIPHER)
+            cipher.init(Cipher.ENCRYPT_MODE, keystoreKey)
+            val cryptoObject = BiometricPrompt.CryptoObject(cipher)
 
-                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-                    super.onAuthenticationError(errorCode, errString)
-                    // If user clicked negative button / cancelled, don't show angry error
-                    if (errorCode == BiometricPrompt.ERROR_USER_CANCELED ||
-                        errorCode == BiometricPrompt.ERROR_NEGATIVE_BUTTON
-                    ) {
-                        onError("cancelled")
-                    } else {
-                        onError(errString.toString())
+            val executor = ContextCompat.getMainExecutor(activity)
+            val prompt = BiometricPrompt(
+                activity,
+                executor,
+                object : BiometricPrompt.AuthenticationCallback() {
+                    override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                        super.onAuthenticationSucceeded(result)
+                        val authenticatedCipher = result.cryptoObject?.cipher
+                        if (authenticatedCipher == null) {
+                            onError("Biometric authentication missing authenticated cipher")
+                            return
+                        }
+                        try {
+                            val iv = authenticatedCipher.iv
+                            val encryptedKeyBytes = authenticatedCipher.doFinal(masterKeyToWrap.encoded)
+                            val combined = ByteArray(iv.size + encryptedKeyBytes.size)
+                            System.arraycopy(iv, 0, combined, 0, iv.size)
+                            System.arraycopy(encryptedKeyBytes, 0, combined, iv.size, encryptedKeyBytes.size)
+                            val wrappedBase64 = Base64.encodeToString(combined, Base64.NO_WRAP)
+                            onEnrolled(wrappedBase64)
+                        } catch (e: Exception) {
+                            onError("Failed to wrap master key: ${e.localizedMessage}")
+                        }
+                    }
+
+                    override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                        super.onAuthenticationError(errorCode, errString)
+                        if (errorCode == BiometricPrompt.ERROR_USER_CANCELED ||
+                            errorCode == BiometricPrompt.ERROR_NEGATIVE_BUTTON
+                        ) {
+                            onError("cancelled")
+                        } else {
+                            onError(errString.toString())
+                        }
+                    }
+
+                    override fun onAuthenticationFailed() {
+                        super.onAuthenticationFailed()
+                        onError("Biometric verification failed. Try again.")
                     }
                 }
-
-                override fun onAuthenticationFailed() {
-                    super.onAuthenticationFailed()
-                    onError("Biometric authentication failed. Try again.")
-                }
-            }
-        )
-
-        val promptInfo = BiometricPrompt.PromptInfo.Builder()
-            .setTitle(title)
-            .setSubtitle(subtitle)
-            .setNegativeButtonText(negativeButtonText)
-            .setAllowedAuthenticators(
-                BiometricManager.Authenticators.BIOMETRIC_STRONG or
-                        BiometricManager.Authenticators.BIOMETRIC_WEAK
             )
-            .build()
 
-        prompt.authenticate(promptInfo)
+            val promptInfo = BiometricPrompt.PromptInfo.Builder()
+                .setTitle(title)
+                .setSubtitle(subtitle)
+                .setNegativeButtonText(negativeButtonText)
+                .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+                .build()
+
+            prompt.authenticate(promptInfo, cryptoObject)
+        } catch (e: Exception) {
+            onError("Biometric initialization failed: ${e.localizedMessage}")
+        }
+    }
+
+    /**
+     * Authenticates user via BiometricPrompt.CryptoObject and decrypts (unwraps) the Master Key
+     * in one atomic hardware-authenticated step.
+     */
+    fun promptBiometricUnlock(
+        activity: FragmentActivity,
+        wrappedKeyBase64: String,
+        title: String = "Unlock VaultLock",
+        subtitle: String = "Verify identity with strong biometrics",
+        negativeButtonText: String = "Use Master Password",
+        onSuccess: (SecretKey) -> Unit,
+        onError: (String) -> Unit
+    ) {
+        try {
+            val combined = Base64.decode(wrappedKeyBase64, Base64.NO_WRAP)
+            if (combined.size < GCM_IV_LENGTH) {
+                onError("Invalid wrapped key format")
+                return
+            }
+
+            val iv = ByteArray(GCM_IV_LENGTH)
+            System.arraycopy(combined, 0, iv, 0, GCM_IV_LENGTH)
+
+            val cipherTextSize = combined.size - GCM_IV_LENGTH
+            val cipherText = ByteArray(cipherTextSize)
+            System.arraycopy(combined, GCM_IV_LENGTH, cipherText, 0, cipherTextSize)
+
+            val keystoreKey = getOrCreateKeystoreKey()
+            val cipher = Cipher.getInstance(AES_GCM_CIPHER)
+            val spec = GCMParameterSpec(GCM_TAG_LENGTH, iv)
+            cipher.init(Cipher.DECRYPT_MODE, keystoreKey, spec)
+            val cryptoObject = BiometricPrompt.CryptoObject(cipher)
+
+            val executor = ContextCompat.getMainExecutor(activity)
+            val prompt = BiometricPrompt(
+                activity,
+                executor,
+                object : BiometricPrompt.AuthenticationCallback() {
+                    override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                        super.onAuthenticationSucceeded(result)
+                        val authenticatedCipher = result.cryptoObject?.cipher
+                        if (authenticatedCipher == null) {
+                            onError("Biometric authentication missing authenticated cipher")
+                            return
+                        }
+                        try {
+                            val decryptedKeyBytes = authenticatedCipher.doFinal(cipherText)
+                            val secretKey = SecretKeySpec(decryptedKeyBytes, "AES")
+                            onSuccess(secretKey)
+                        } catch (e: Exception) {
+                            onError("Failed to unwrap key: ${e.localizedMessage}")
+                        }
+                    }
+
+                    override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                        super.onAuthenticationError(errorCode, errString)
+                        if (errorCode == BiometricPrompt.ERROR_USER_CANCELED ||
+                            errorCode == BiometricPrompt.ERROR_NEGATIVE_BUTTON
+                        ) {
+                            onError("cancelled")
+                        } else {
+                            onError(errString.toString())
+                        }
+                    }
+
+                    override fun onAuthenticationFailed() {
+                        super.onAuthenticationFailed()
+                        onError("Biometric verification failed. Try again.")
+                    }
+                }
+            )
+
+            val promptInfo = BiometricPrompt.PromptInfo.Builder()
+                .setTitle(title)
+                .setSubtitle(subtitle)
+                .setNegativeButtonText(negativeButtonText)
+                .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+                .build()
+
+            prompt.authenticate(promptInfo, cryptoObject)
+        } catch (e: Exception) {
+            onError("Biometric setup failed: ${e.localizedMessage}")
+        }
     }
 }

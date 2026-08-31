@@ -19,11 +19,12 @@ abstract class VaultDatabase : RoomDatabase() {
 
         fun getInstance(context: Context): VaultDatabase {
             return INSTANCE ?: synchronized(this) {
+                // Keep version 1 without fallbackToDestructiveMigration to avoid accidentally wiping user vaults
                 val instance = Room.databaseBuilder(
                     context.applicationContext,
                     VaultDatabase::class.java,
                     "vaultlock_secure.db"
-                ).fallbackToDestructiveMigration().build()
+                ).build()
                 INSTANCE = instance
                 instance
             }
