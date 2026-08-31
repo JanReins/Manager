@@ -312,6 +312,7 @@ fun SettingsScreen(
                         onClick = {
                             viewModel.exportBackup { backupBytes ->
                                 if (backupBytes != null) {
+                                    viewModel.suppressNextBackgroundLock()
                                     shareBackupFile(context, backupBytes)
                                 }
                             }
@@ -325,6 +326,7 @@ fun SettingsScreen(
                         title = "Restore Encrypted Backup",
                         subtitle = "Restore passwords from a VaultLock backup file",
                         onClick = {
+                            viewModel.suppressNextBackgroundLock()
                             restoreBackupLauncher.launch("*/*")
                         },
                         testTag = "setting_restore_backup"

@@ -153,14 +153,26 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         autoLockJob = null
     }
 
+    private var ignoreNextBackgroundLock = false
+
+    fun suppressNextBackgroundLock() {
+        ignoreNextBackgroundLock = true
+    }
+
     /**
-     * Locks the vault immediately when the application is sent to the background.
+     * Locks the vault immediately when the application is sent to the background,
+     * unless temporarily suppressed by system file picker or share sheet activities.
      */
     fun onAppBackgrounded() {
+        if (ignoreNextBackgroundLock) {
+            ignoreNextBackgroundLock = false
+            return
+        }
         lockVault()
     }
 
     fun onAppForegrounded() {
+        ignoreNextBackgroundLock = false
         if (_uiState.value.isUnlocked) {
             val timeoutMillis = _uiState.value.autoLockSeconds * 1000L
             if (timeoutMillis > 0) {
