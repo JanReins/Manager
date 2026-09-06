@@ -2,5 +2,5 @@
   "name": "VaultLock",
   "description": "A fully offline, secure personal password manager protected by Master Password and biometric authentication.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": []
 }

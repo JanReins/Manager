@@ -1,6 +1,5 @@
 package com.janreins.vaultlock.ui.screens
 
-import android.content.Context
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -27,12 +26,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AutoAwesome
-import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.FilterList
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Search
@@ -41,6 +38,7 @@ import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarOutline
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.outlined.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -62,7 +60,9 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -78,15 +78,16 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.janreins.vaultlock.crypto.TotpHelper
 import com.janreins.vaultlock.data.VaultEntry
 import com.janreins.vaultlock.ui.VaultUiState
 import com.janreins.vaultlock.ui.VaultViewModel
 import com.janreins.vaultlock.ui.theme.Amber400
 import com.janreins.vaultlock.ui.theme.Amber500
 import com.janreins.vaultlock.ui.theme.BlueInfo
-import com.janreins.vaultlock.ui.theme.EmeraldSuccess
 import com.janreins.vaultlock.ui.theme.PurpleBadge
 import com.janreins.vaultlock.ui.theme.RedError
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -104,6 +105,16 @@ fun VaultScreen(
     val snackbarHostState = remember { SnackbarHostState() }
 
     var entryToDelete by remember { mutableStateOf<VaultEntry?>(null) }
+
+    // Duplicate password tracking set
+    val duplicatePasswordSet = remember(uiState.allEntries) {
+        val nonBlankPwCounts = uiState.allEntries
+            .map { it.password }
+            .filter { it.isNotBlank() }
+            .groupingBy { it }
+            .eachCount()
+        nonBlankPwCounts.filter { it.value > 1 }.keys
+    }
 
     Scaffold(
         topBar = {
@@ -308,6 +319,7 @@ fun VaultScreen(
                     ) { entry ->
                         VaultEntryCard(
                             entry = entry,
+                            isDuplicatePassword = entry.password.isNotBlank() && duplicatePasswordSet.contains(entry.password),
                             activeCopiedLabel = uiState.activeCopiedLabel,
                             onCopyUsername = {
                                 viewModel.copyToClipboard(context, entry.username, "Username")
@@ -319,6 +331,12 @@ fun VaultScreen(
                                 viewModel.copyToClipboard(context, entry.password, "Password")
                                 coroutineScope.launch {
                                     snackbarHostState.showSnackbar("Password copied (clears in 30s)")
+                                }
+                            },
+                            onCopyTotp = { code ->
+                                viewModel.copyToClipboard(context, code, "TOTP Code")
+                                coroutineScope.launch {
+                                    snackbarHostState.showSnackbar("TOTP code copied (clears in 30s)")
                                 }
                             },
                             onToggleFavorite = { viewModel.toggleFavorite(entry) },
@@ -361,15 +379,32 @@ fun VaultScreen(
 @Composable
 fun VaultEntryCard(
     entry: VaultEntry,
+    isDuplicatePassword: Boolean,
     activeCopiedLabel: String?,
     onCopyUsername: () -> Unit,
     onCopyPassword: () -> Unit,
+    onCopyTotp: (String) -> Unit,
     onToggleFavorite: () -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit
 ) {
     var isExpanded by remember { mutableStateOf(false) }
     var isPasswordRevealed by remember { mutableStateOf(false) }
+
+    // Live TOTP ticker state
+    var totpCode by remember(entry.totpSecret) { mutableStateOf<String?>(null) }
+    var totpRemainingSeconds by remember(entry.totpSecret) { mutableIntStateOf(0) }
+
+    if (entry.totpSecret.isNotBlank()) {
+        LaunchedEffect(entry.totpSecret) {
+            while (true) {
+                val now = System.currentTimeMillis()
+                totpCode = TotpHelper.generateTotp(entry.totpSecret, now)
+                totpRemainingSeconds = TotpHelper.getRemainingSeconds(now)
+                delay(1000L)
+            }
+        }
+    }
 
     Card(
         modifier = Modifier
@@ -413,7 +448,7 @@ fun VaultEntryCard(
 
                 Spacer(modifier = Modifier.width(12.dp))
 
-                // Title & Subtitle
+                // Title & Subtitle + TOTP summary if available
                 Column(modifier = Modifier.weight(1f)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
@@ -423,6 +458,32 @@ fun VaultEntryCard(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
+                        if (isDuplicatePassword) {
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(RedError.copy(alpha = 0.15f))
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = Icons.Outlined.Warning,
+                                        contentDescription = "Duplicate Password",
+                                        tint = RedError,
+                                        modifier = Modifier.size(12.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(3.dp))
+                                    Text(
+                                        text = "Duplicate",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = RedError,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 10.sp
+                                    )
+                                }
+                            }
+                        }
                     }
 
                     if (entry.username.isNotBlank()) {
@@ -440,6 +501,19 @@ fun VaultEntryCard(
                             color = BlueInfo,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    // Live TOTP badge on list item
+                    if (entry.totpSecret.isNotBlank() && totpCode != null) {
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "2FA: ${totpCode?.take(3)} ${totpCode?.drop(3)} (${totpRemainingSeconds}s)",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold
+                            ),
+                            color = Amber400
                         )
                     }
                 }
@@ -484,6 +558,58 @@ fun VaultEntryCard(
                         .fillMaxWidth()
                         .padding(top = 16.dp)
                 ) {
+                    // TOTP Live Box
+                    if (entry.totpSecret.isNotBlank() && totpCode != null) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(MaterialTheme.colorScheme.surface)
+                                .padding(12.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "AUTHENTICATOR CODE (2FA)",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            text = "${totpCode?.take(3)} ${totpCode?.drop(3)}",
+                                            style = MaterialTheme.typography.titleMedium.copy(
+                                                fontFamily = FontFamily.Monospace,
+                                                fontWeight = FontWeight.Bold
+                                            ),
+                                            color = Amber400,
+                                            modifier = Modifier.padding(top = 2.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(10.dp))
+                                        Text(
+                                            text = "${totpRemainingSeconds}s",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+
+                                IconButton(onClick = { totpCode?.let { onCopyTotp(it) } }) {
+                                    Icon(
+                                        imageVector = Icons.Default.ContentCopy,
+                                        contentDescription = "Copy TOTP",
+                                        tint = Amber400,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                    }
+
                     // Password Detail Box
                     if (entry.password.isNotBlank()) {
                         Box(

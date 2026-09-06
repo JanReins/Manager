@@ -74,6 +74,7 @@ class VaultRepository(
                 put("password", domain.password)
                 put("url", domain.url)
                 put("notes", domain.notes)
+                put("totpSecret", domain.totpSecret)
                 put("category", domain.category)
                 put("isFavorite", domain.isFavorite)
                 put("createdAt", domain.createdAt)
@@ -111,6 +112,7 @@ class VaultRepository(
                 password = obj.optString("password", ""),
                 url = obj.optString("url", ""),
                 notes = obj.optString("notes", ""),
+                totpSecret = obj.optString("totpSecret", ""),
                 category = obj.optString("category", "Login"),
                 isFavorite = obj.optBoolean("isFavorite", false),
                 createdAt = obj.optLong("createdAt", System.currentTimeMillis()),
@@ -138,6 +140,7 @@ class VaultRepository(
                 password = "••••",
                 url = "",
                 notes = "",
+                totpSecret = "",
                 category = category,
                 isFavorite = isFavorite,
                 createdAt = createdAt,
@@ -153,6 +156,7 @@ class VaultRepository(
                 password = CryptoManager.decrypt(encryptedPassword, key),
                 url = CryptoManager.decrypt(encryptedUrl, key),
                 notes = CryptoManager.decrypt(encryptedNotes, key),
+                totpSecret = CryptoManager.decrypt(encryptedTotpSecret, key),
                 category = category,
                 isFavorite = isFavorite,
                 createdAt = createdAt,
@@ -166,6 +170,7 @@ class VaultRepository(
                 password = "",
                 url = "",
                 notes = "",
+                totpSecret = "",
                 category = category,
                 isFavorite = isFavorite,
                 createdAt = createdAt,
@@ -182,6 +187,7 @@ class VaultRepository(
             encryptedPassword = CryptoManager.encrypt(password, key),
             encryptedUrl = CryptoManager.encrypt(url.trim(), key),
             encryptedNotes = CryptoManager.encrypt(notes, key),
+            encryptedTotpSecret = CryptoManager.encrypt(totpSecret.trim(), key),
             category = category,
             isFavorite = isFavorite,
             createdAt = if (createdAt == 0L) System.currentTimeMillis() else createdAt,

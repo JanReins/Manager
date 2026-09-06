@@ -1,21 +1,26 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
+# VaultLock ProGuard & R8 Hardening Rules
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# --- Room Database ---
+-keep class androidx.room.RoomDatabase
+-dontwarn androidx.room.paging.**
+-keep class * extends androidx.room.RoomDatabase
+-keep @androidx.room.Database class *
+-keep @androidx.room.Entity class *
+-keep class * implements androidx.sqlite.db.SupportSQLiteOpenHelper$Factory
+-keepclassmembers class * {
+    @androidx.room.Dao *;
+}
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# --- Jetpack Compose ---
+-keep class androidx.compose.ui.** { *; }
+-keepclassmembers class * extends androidx.compose.ui.node.ModifierNodeElement {
+    <init>(...);
+}
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# --- Biometric & Crypto ---
+-keep class androidx.biometric.** { *; }
+-keep class androidx.security.crypto.** { *; }
+
+# Preserve Vault Entities & Security Preference Data Models
+-keep class com.janreins.vaultlock.data.** { *; }
+-keep class com.janreins.vaultlock.crypto.** { *; }

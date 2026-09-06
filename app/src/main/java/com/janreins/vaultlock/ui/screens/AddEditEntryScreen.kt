@@ -20,6 +20,7 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CreditCard
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Person
@@ -83,6 +84,7 @@ fun AddEditEntryScreen(
     var password by remember { mutableStateOf("") }
     var url by remember { mutableStateOf("") }
     var notes by remember { mutableStateOf("") }
+    var totpSecret by remember { mutableStateOf("") }
     var category by remember { mutableStateOf("Login") }
     var isFavorite by remember { mutableStateOf(false) }
 
@@ -100,6 +102,7 @@ fun AddEditEntryScreen(
                 password = existing.password
                 url = existing.url
                 notes = existing.notes
+                totpSecret = existing.totpSecret
                 category = existing.category
                 isFavorite = existing.isFavorite
             }
@@ -314,6 +317,26 @@ fun AddEditEntryScreen(
 
                     Spacer(modifier = Modifier.height(14.dp))
 
+                    // TOTP Secret Field (2FA Authenticator)
+                    OutlinedTextField(
+                        value = totpSecret,
+                        onValueChange = { totpSecret = it },
+                        label = { Text("TOTP Secret Key (Optional 2FA)") },
+                        leadingIcon = {
+                            Icon(Icons.Default.Key, null, tint = Amber400)
+                        },
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = Amber400,
+                            unfocusedBorderColor = MaterialTheme.colorScheme.outline
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("entry_input_totp")
+                    )
+
+                    Spacer(modifier = Modifier.height(14.dp))
+
                     // Website URL Field
                     OutlinedTextField(
                         value = url,
@@ -371,6 +394,7 @@ fun AddEditEntryScreen(
                             password = password,
                             url = url.trim(),
                             notes = notes.trim(),
+                            totpSecret = totpSecret.trim(),
                             category = category,
                             isFavorite = isFavorite,
                             createdAt = if (isEdit) 0L else System.currentTimeMillis(),
