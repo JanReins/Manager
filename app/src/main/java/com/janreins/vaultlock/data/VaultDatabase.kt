@@ -9,7 +9,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
     entities = [VaultEntryEntity::class],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 abstract class VaultDatabase : RoomDatabase() {
@@ -47,6 +47,29 @@ abstract class VaultDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * Migration from version 2 to 3.
+         * Adds encrypted_totp_secret column to vault_entries table.
+         */
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                val cursor = db.query("PRAGMA table_info(vault_entries)")
+                var hasTotpSecret = false
+                while (cursor.moveToNext()) {
+                    val nameIndex = cursor.getColumnIndex("name")
+                    if (nameIndex != -1) {
+                        val colName = cursor.getString(nameIndex)
+                        if (colName == "encrypted_totp_secret") hasTotpSecret = true
+                    }
+                }
+                cursor.close()
+
+                if (!hasTotpSecret) {
+                    db.execSQL("ALTER TABLE vault_entries ADD COLUMN encrypted_totp_secret TEXT NOT NULL DEFAULT ''")
+                }
+            }
+        }
+
         fun getInstance(context: Context): VaultDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -54,7 +77,7 @@ abstract class VaultDatabase : RoomDatabase() {
                     VaultDatabase::class.java,
                     "vaultlock_secure.db"
                 )
-                    .addMigrations(MIGRATION_1_2)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                     .build()
                 INSTANCE = instance
                 instance
