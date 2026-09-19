@@ -1,6 +1,7 @@
 package com.janreins.vaultlock
 
 import android.app.Application
+import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import com.janreins.vaultlock.crypto.SessionManager
 import com.janreins.vaultlock.data.SecurityPreferences
@@ -41,7 +42,8 @@ class MasterPasswordChangeTest {
     fun setUp() {
         Dispatchers.setMain(testDispatcher)
         application = ApplicationProvider.getApplicationContext()
-        securityPreferences = SecurityPreferences(application)
+        val testPrefs = application.getSharedPreferences("test_vaultlock_prefs", Context.MODE_PRIVATE)
+        securityPreferences = SecurityPreferences(application, customPrefs = testPrefs)
         database = VaultDatabase.getInstance(application)
         repository = VaultRepository(database.vaultDao(), securityPreferences)
     }
@@ -126,25 +128,29 @@ class MasterPasswordChangeTest {
         val oldPass = "OldMasterPass123!"
         val newPass = "NewMasterPass456!"
 
+        // 1. Setup master password
         val oldKey = securityPreferences.setupMasterPassword(oldPass.toCharArray())
-        assertNotNull(oldKey)
+        SessionManager.setKey(oldKey)
 
+        // 2. Prepare new master password credentials
         val prepared = securityPreferences.prepareMasterPasswordChange(newPass.toCharArray())
 
-        // Simulate exception during re-encrypt (e.g. database error)
-        var reEncryptFailed = false
+        // 3. Force reEncryptAll failure by closing database or using failing repository call
+        database.close()
+
+        var exceptionThrown = false
         try {
-            // Suppose re-encryption threw an exception before commitMasterPasswordChange
-            throw RuntimeException("Database I/O error during re-encryption")
-            @Suppress("UNREACHABLE_CODE")
+            // Attempting re-encrypt on closed database will throw IllegalStateException or similar
+            repository.reEncryptAll(oldKey, prepared.secretKey)
+            // If re-encryption succeeds (unexpected here), commit would happen next
             securityPreferences.commitMasterPasswordChange(prepared)
         } catch (_: Exception) {
-            reEncryptFailed = true
+            exceptionThrown = true
         }
 
-        assertTrue(reEncryptFailed)
+        assertTrue(exceptionThrown)
 
-        // Old master password must still be intact and valid in securityPreferences
+        // 4. Assert old password still verifies and new password does not
         assertNotNull(securityPreferences.verifyAndDeriveKey(oldPass.toCharArray()))
         assertNull(securityPreferences.verifyAndDeriveKey(newPass.toCharArray()))
     }

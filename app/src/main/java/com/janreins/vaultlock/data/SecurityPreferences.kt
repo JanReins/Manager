@@ -12,27 +12,23 @@ import javax.crypto.SecretKey
  * Security preferences stored in Android Keystore backed EncryptedSharedPreferences.
  * Stores encryption salt, authentication verifier token, wrapped master keys, and app flags.
  */
-class SecurityPreferences(context: Context) {
+class SecurityPreferences(context: Context, customPrefs: SharedPreferences? = null) {
 
-    private val prefs: SharedPreferences
+    private val prefs: SharedPreferences = customPrefs ?: run {
+        val masterKey = MasterKey.Builder(context.applicationContext)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .build()
+
+        EncryptedSharedPreferences.create(
+            context.applicationContext,
+            ENCRYPTED_PREFS_FILE,
+            masterKey,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        )
+    }
 
     init {
-        prefs = try {
-            val masterKey = MasterKey.Builder(context.applicationContext)
-                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                .build()
-
-            EncryptedSharedPreferences.create(
-                context.applicationContext,
-                ENCRYPTED_PREFS_FILE,
-                masterKey,
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-            )
-        } catch (_: Exception) {
-            context.getSharedPreferences(ENCRYPTED_PREFS_FILE, Context.MODE_PRIVATE)
-        }
-
         // Seamless one-time migration from legacy plain SharedPreferences if present
         migrateLegacyPlainPrefsIfPresent(context)
     }
@@ -105,15 +101,15 @@ class SecurityPreferences(context: Context) {
     }
 
     /**
-     * Persists prepared master password credentials to SharedPreferences.
+     * Persists prepared master password credentials to SharedPreferences using blocking commit().
      */
-    fun commitMasterPasswordChange(prepared: PreparedMasterPassword) {
-        prefs.edit()
+    fun commitMasterPasswordChange(prepared: PreparedMasterPassword): Boolean {
+        return prefs.edit()
             .putBoolean(KEY_IS_SETUP, true)
             .putString(KEY_SALT, prepared.saltBase64)
             .putString(KEY_VERIFIER, prepared.verifierEncrypted)
             .putLong(KEY_AUTO_LOCK_SECONDS, prefs.getLong(KEY_AUTO_LOCK_SECONDS, 120L))
-            .apply()
+            .commit()
     }
 
     /**
