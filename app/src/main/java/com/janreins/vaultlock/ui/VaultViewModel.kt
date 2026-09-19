@@ -356,15 +356,16 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                     return@launch
                 }
 
-                val newKey = securityPreferences.setupMasterPassword(newPass.toCharArray())
-                repository.reEncryptAll(oldKey, newKey)
-                SessionManager.setKey(newKey)
+                val prepared = securityPreferences.prepareMasterPasswordChange(newPass.toCharArray())
+                repository.reEncryptAll(oldKey, prepared.secretKey)
+                securityPreferences.commitMasterPasswordChange(prepared)
+                SessionManager.setKey(prepared.secretKey)
 
                 // Re-enroll biometric if it was active
                 if (securityPreferences.isBiometricEnabled && activity != null) {
                     BiometricHelper.promptBiometricEnrollment(
                         activity = activity,
-                        masterKeyToWrap = newKey,
+                        masterKeyToWrap = prepared.secretKey,
                         onEnrolled = { wrappedKey ->
                             securityPreferences.saveBiometricWrappedKey(wrappedKey)
                             onResult(true, "Master Password changed & biometric updated")
