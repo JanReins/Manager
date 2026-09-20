@@ -12,24 +12,23 @@ import javax.crypto.SecretKey
  * Security preferences stored in Android Keystore backed EncryptedSharedPreferences.
  * Stores encryption salt, authentication verifier token, wrapped master keys, and app flags.
  */
-class SecurityPreferences(context: Context) {
+class SecurityPreferences(context: Context, customPrefs: SharedPreferences? = null) {
 
-    private val prefs: SharedPreferences
-
-    init {
-        // Initialize MasterKey for AES-256-GCM Keystore-backed encryption of preferences
+    private val prefs: SharedPreferences = customPrefs ?: run {
         val masterKey = MasterKey.Builder(context.applicationContext)
             .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
             .build()
 
-        prefs = EncryptedSharedPreferences.create(
+        EncryptedSharedPreferences.create(
             context.applicationContext,
             ENCRYPTED_PREFS_FILE,
             masterKey,
             EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
             EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
         )
+    }
 
+    init {
         // Seamless one-time migration from legacy plain SharedPreferences if present
         migrateLegacyPlainPrefsIfPresent(context)
     }
@@ -83,25 +82,45 @@ class SecurityPreferences(context: Context) {
     val themeMode: String
         get() = prefs.getString(KEY_THEME_MODE, "dark") ?: "dark"
 
+    data class PreparedMasterPassword(
+        val secretKey: SecretKey,
+        val saltBase64: String,
+        val verifierEncrypted: String
+    )
+
     /**
-     * Initializes the Master Password for the first time or updates it.
-     * Generates a unique 32-byte salt, derives the Master Key via PBKDF2 (150,000 iterations),
-     * and stores the encrypted magic verification token in EncryptedSharedPreferences.
+     * Prepares new master password credentials (salt, derived key, verifier token) in memory
+     * WITHOUT persisting them to SharedPreferences.
      */
-    fun setupMasterPassword(password: CharArray): SecretKey {
+    fun prepareMasterPasswordChange(password: CharArray): PreparedMasterPassword {
         val salt = CryptoManager.generateSalt()
         val derivedKey = CryptoManager.deriveKey(password, salt)
         val verifierEncrypted = CryptoManager.encrypt(VERIFIER_MAGIC, derivedKey)
         val saltBase64 = Base64.encodeToString(salt, Base64.NO_WRAP)
+        return PreparedMasterPassword(derivedKey, saltBase64, verifierEncrypted)
+    }
 
-        prefs.edit()
+    /**
+     * Persists prepared master password credentials to SharedPreferences using blocking commit().
+     */
+    fun commitMasterPasswordChange(prepared: PreparedMasterPassword): Boolean {
+        return prefs.edit()
             .putBoolean(KEY_IS_SETUP, true)
-            .putString(KEY_SALT, saltBase64)
-            .putString(KEY_VERIFIER, verifierEncrypted)
+            .putString(KEY_SALT, prepared.saltBase64)
+            .putString(KEY_VERIFIER, prepared.verifierEncrypted)
             .putLong(KEY_AUTO_LOCK_SECONDS, prefs.getLong(KEY_AUTO_LOCK_SECONDS, 120L))
-            .apply()
+            .commit()
+    }
 
-        return derivedKey
+    /**
+     * Initializes the Master Password for the first time or updates it immediately.
+     * Generates a unique 32-byte salt, derives the Master Key via PBKDF2 (150,000 iterations),
+     * and stores the encrypted magic verification token in EncryptedSharedPreferences.
+     */
+    fun setupMasterPassword(password: CharArray): SecretKey {
+        val prepared = prepareMasterPasswordChange(password)
+        commitMasterPasswordChange(prepared)
+        return prepared.secretKey
     }
 
     /**
