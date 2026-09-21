@@ -404,7 +404,7 @@ fun UnlockScreen(
                                     )
                                 } else {
                                     Text(
-                                        text = "Unlock Vault",
+                                        text = if (uiState.lockoutRemainingSeconds > 0) "Try again in ${uiState.lockoutRemainingSeconds}s" else "Unlock Vault",
                                         fontWeight = FontWeight.Bold,
                                         fontSize = 16.sp,
                                         color = Color(0xFF0F172A)
@@ -440,10 +440,15 @@ fun UnlockScreen(
                         }
 
                         // Error Message Display
-                        if (errorMessage != null) {
+                        val displayError = when {
+                            errorMessage != null -> errorMessage
+                            uiState.lockoutRemainingSeconds > 0 -> "Too many failed attempts. Try again in ${uiState.lockoutRemainingSeconds} second(s)."
+                            else -> null
+                        }
+                        if (displayError != null) {
                             Spacer(modifier = Modifier.height(12.dp))
                             Text(
-                                text = errorMessage ?: "",
+                                text = displayError,
                                 color = RedError,
                                 style = MaterialTheme.typography.bodySmall,
                                 textAlign = TextAlign.Center

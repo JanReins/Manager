@@ -37,14 +37,27 @@ object CryptoManager {
 
     /**
      * Derives a 256-bit AES SecretKey from the user's Master Password and a salt
-     * using PBKDF2 with 150,000 iterations. Zeroizes the password character buffer in memory.
+     * using PBKDF2 with 150,000 iterations. Zeroizes the password character buffer in memory
+     * and clears temporary key byte arrays after building the SecretKeySpec.
      */
     fun deriveKey(masterPassword: CharArray, salt: ByteArray): SecretKey {
         val spec = PBEKeySpec(masterPassword, salt, ITERATION_COUNT, KEY_LENGTH_BITS)
         return try {
             val factory = SecretKeyFactory.getInstance(PBKDF2_ALGORITHM)
-            val keyBytes = factory.generateSecret(spec).encoded
-            SecretKeySpec(keyBytes, "AES")
+            val pbeKey = factory.generateSecret(spec)
+            val keyBytes = pbeKey.encoded
+            try {
+                SecretKeySpec(keyBytes, "AES")
+            } finally {
+                keyBytes?.fill(0)
+                try {
+                    if (!pbeKey.isDestroyed) {
+                        pbeKey.destroy()
+                    }
+                } catch (_: Exception) {
+                    // Ignored best effort destroy
+                }
+            }
         } finally {
             // Security hardening: zeroize the password array inside the spec to protect memory
             spec.clearPassword()

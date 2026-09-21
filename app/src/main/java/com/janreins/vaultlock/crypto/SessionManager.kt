@@ -7,7 +7,8 @@ import javax.crypto.SecretKey
 
 /**
  * Manages the in-memory active cryptographic session.
- * Zeroizes/wipes the session key on lock to prevent memory scraping.
+ * Best-effort zeroization on lock to clear key references and destroy secret key objects where supported.
+ * Note: Due to JVM heap behavior, immutable SecretKeySpec internal arrays may persist until collected by GC.
  */
 object SessionManager {
     private var activeSecretKey: SecretKey? = null
@@ -35,6 +36,16 @@ object SessionManager {
     fun getLastActivity(): Long = lastActiveTimestamp
 
     fun lock() {
+        val key = activeSecretKey
+        if (key != null) {
+            try {
+                if (!key.isDestroyed) {
+                    key.destroy()
+                }
+            } catch (_: Exception) {
+                // Best effort destroy if supported by provider/implementation
+            }
+        }
         activeSecretKey = null
         _isUnlocked.value = false
     }
