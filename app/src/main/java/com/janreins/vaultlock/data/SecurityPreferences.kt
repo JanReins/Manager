@@ -67,6 +67,8 @@ class SecurityPreferences(context: Context, customPrefs: SharedPreferences? = nu
         private const val KEY_WRAPPED_KEY = "key_wrapped_master_key"
         private const val KEY_AUTO_LOCK_SECONDS = "key_auto_lock_seconds"
         private const val KEY_THEME_MODE = "key_theme_mode" // "system", "dark", "light"
+        private const val KEY_FAILED_ATTEMPTS = "key_failed_attempts"
+        private const val KEY_LOCKOUT_UNTIL = "key_lockout_until"
         private const val VERIFIER_MAGIC = "VAULTLOCK_VERIFY_PAYLOAD_V1"
     }
 
@@ -180,6 +182,43 @@ class SecurityPreferences(context: Context, customPrefs: SharedPreferences? = nu
 
     fun setThemeMode(mode: String) {
         prefs.edit().putString(KEY_THEME_MODE, mode).apply()
+    }
+
+    fun getFailedUnlockAttempts(): Int = prefs.getInt(KEY_FAILED_ATTEMPTS, 0)
+
+    fun getLockoutUntil(): Long = prefs.getLong(KEY_LOCKOUT_UNTIL, 0L)
+
+    fun getLockoutRemainingMillis(): Long {
+        val lockoutUntil = prefs.getLong(KEY_LOCKOUT_UNTIL, 0L)
+        val remaining = lockoutUntil - System.currentTimeMillis()
+        return if (remaining > 0) remaining else 0L
+    }
+
+    fun calculateBackoffDelaySeconds(attempts: Int): Long {
+        if (attempts <= 0) return 0L
+        val exponent = (attempts - 1).coerceAtMost(30)
+        val delay = 1L shl exponent
+        return delay.coerceAtMost(60L)
+    }
+
+    fun recordFailedUnlockAttempt(): Long {
+        val currentAttempts = prefs.getInt(KEY_FAILED_ATTEMPTS, 0) + 1
+        val delaySeconds = calculateBackoffDelaySeconds(currentAttempts)
+        val lockoutUntil = System.currentTimeMillis() + delaySeconds * 1000L
+
+        prefs.edit()
+            .putInt(KEY_FAILED_ATTEMPTS, currentAttempts)
+            .putLong(KEY_LOCKOUT_UNTIL, lockoutUntil)
+            .apply()
+
+        return delaySeconds
+    }
+
+    fun resetFailedUnlockAttempts() {
+        prefs.edit()
+            .remove(KEY_FAILED_ATTEMPTS)
+            .remove(KEY_LOCKOUT_UNTIL)
+            .apply()
     }
 
     fun wipeAll() {

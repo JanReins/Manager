@@ -45,12 +45,16 @@ data class VaultUiState(
     val generatorOptions: GeneratorOptions = GeneratorOptions(),
     val errorMessage: String? = null,
     val successMessage: String? = null,
-    val activeCopiedLabel: String? = null // For clipboard feedback animation
+    val activeCopiedLabel: String? = null, // For clipboard feedback animation
+    val lockoutRemainingSeconds: Long = 0L
 )
 
-class VaultViewModel(application: Application) : AndroidViewModel(application) {
+class VaultViewModel @JvmOverloads constructor(
+    application: Application,
+    customSecurityPreferences: SecurityPreferences? = null
+) : AndroidViewModel(application) {
 
-    private val securityPreferences = SecurityPreferences(application)
+    private val securityPreferences = customSecurityPreferences ?: SecurityPreferences(application)
     private val database = VaultDatabase.getInstance(application)
     private val repository = VaultRepository(database.vaultDao(), securityPreferences)
 
@@ -68,10 +72,16 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     val uiState: StateFlow<VaultUiState> = _uiState.asStateFlow()
 
     private var autoLockJob: Job? = null
+    private var lockoutCountdownJob: Job? = null
     private val clipboardClearHandler = Handler(Looper.getMainLooper())
     private var clipboardClearRunnable: Runnable? = null
 
     init {
+        // Check for existing unlock lockout on initialization
+        if (securityPreferences.getLockoutRemainingMillis() > 0) {
+            startLockoutCountdown()
+        }
+
         // Observe SessionManager unlock state
         viewModelScope.launch {
             SessionManager.isUnlocked.collect { unlocked ->
@@ -151,6 +161,23 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     private fun stopInactivityTimer() {
         autoLockJob?.cancel()
         autoLockJob = null
+    }
+
+    private fun startLockoutCountdown() {
+        lockoutCountdownJob?.cancel()
+        lockoutCountdownJob = viewModelScope.launch {
+            while (true) {
+                val remainingMs = securityPreferences.getLockoutRemainingMillis()
+                val remainingSec = (remainingMs + 999) / 1000
+                if (remainingSec <= 0) {
+                    _uiState.update { it.copy(lockoutRemainingSeconds = 0) }
+                    break
+                } else {
+                    _uiState.update { it.copy(lockoutRemainingSeconds = remainingSec) }
+                }
+                delay(1000)
+            }
+        }
     }
 
     private var ignoreNextBackgroundLock = false
@@ -236,17 +263,33 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
     /**
      * Unlocks the vault by verifying the master password and deriving the session key.
+     * Enforces rate limiting with exponential backoff on failed attempts.
      */
     fun unlockWithPassword(password: String, onResult: (Boolean, String) -> Unit) {
+        val remainingMs = securityPreferences.getLockoutRemainingMillis()
+        if (remainingMs > 0) {
+            val seconds = (remainingMs + 999) / 1000
+            val msg = "Too many failed attempts. Try again in $seconds second(s)."
+            _uiState.update { it.copy(errorMessage = msg, lockoutRemainingSeconds = seconds) }
+            startLockoutCountdown()
+            onResult(false, msg)
+            return
+        }
+
         viewModelScope.launch {
             try {
                 val key = securityPreferences.verifyAndDeriveKey(password.toCharArray())
                 if (key != null) {
+                    securityPreferences.resetFailedUnlockAttempts()
                     SessionManager.setKey(key)
-                    _uiState.update { it.copy(isUnlocked = true, errorMessage = null) }
+                    _uiState.update { it.copy(isUnlocked = true, errorMessage = null, lockoutRemainingSeconds = 0) }
                     onResult(true, "Vault Unlocked")
                 } else {
-                    onResult(false, "Incorrect Master Password")
+                    val delaySeconds = securityPreferences.recordFailedUnlockAttempt()
+                    val msg = "Incorrect Master Password. Try again in $delaySeconds second(s)."
+                    _uiState.update { it.copy(errorMessage = msg, lockoutRemainingSeconds = delaySeconds) }
+                    startLockoutCountdown()
+                    onResult(false, msg)
                 }
             } catch (e: Exception) {
                 onResult(false, "Authentication error: ${e.localizedMessage}")
@@ -274,8 +317,9 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             activity = activity,
             wrappedKeyBase64 = wrappedKey,
             onSuccess = { secretKey ->
+                securityPreferences.resetFailedUnlockAttempts()
                 SessionManager.setKey(secretKey)
-                _uiState.update { it.copy(isUnlocked = true, errorMessage = null) }
+                _uiState.update { it.copy(isUnlocked = true, errorMessage = null, lockoutRemainingSeconds = 0) }
                 onResult(true, "Unlocked via Biometrics")
             },
             onError = { error ->
@@ -350,11 +394,26 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch {
             try {
-                val oldKey = securityPreferences.verifyAndDeriveKey(currentPass.toCharArray())
-                if (oldKey == null) {
-                    onResult(false, "Current password is incorrect")
+                val remainingMs = securityPreferences.getLockoutRemainingMillis()
+                if (remainingMs > 0) {
+                    val seconds = (remainingMs + 999) / 1000
+                    val msg = "Too many failed attempts. Try again in $seconds second(s)."
+                    _uiState.update { it.copy(errorMessage = msg, lockoutRemainingSeconds = seconds) }
+                    startLockoutCountdown()
+                    onResult(false, msg)
                     return@launch
                 }
+
+                val oldKey = securityPreferences.verifyAndDeriveKey(currentPass.toCharArray())
+                if (oldKey == null) {
+                    val delaySeconds = securityPreferences.recordFailedUnlockAttempt()
+                    val msg = "Current password is incorrect. Try again in $delaySeconds second(s)."
+                    _uiState.update { it.copy(errorMessage = msg, lockoutRemainingSeconds = delaySeconds) }
+                    startLockoutCountdown()
+                    onResult(false, msg)
+                    return@launch
+                }
+                securityPreferences.resetFailedUnlockAttempts()
 
                 val prepared = securityPreferences.prepareMasterPasswordChange(newPass.toCharArray())
                 repository.reEncryptAll(oldKey, prepared.secretKey)
