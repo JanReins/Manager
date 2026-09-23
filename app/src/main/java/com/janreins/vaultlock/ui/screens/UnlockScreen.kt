@@ -357,7 +357,7 @@ fun UnlockScreen(
                                 ),
                                 keyboardActions = KeyboardActions(
                                     onDone = {
-                                        if (passwordInput.isNotBlank()) {
+                                        if (passwordInput.isNotBlank() && uiState.lockoutRemainingSeconds <= 0L) {
                                             isProcessing = true
                                             viewModel.unlockWithPassword(passwordInput) { success, msg ->
                                                 isProcessing = false
@@ -380,7 +380,7 @@ fun UnlockScreen(
 
                             Button(
                                 onClick = {
-                                    if (passwordInput.isNotBlank()) {
+                                    if (passwordInput.isNotBlank() && uiState.lockoutRemainingSeconds <= 0L) {
                                         isProcessing = true
                                         viewModel.unlockWithPassword(passwordInput) { success, msg ->
                                             isProcessing = false
@@ -388,7 +388,7 @@ fun UnlockScreen(
                                         }
                                     }
                                 },
-                                enabled = !isProcessing && passwordInput.isNotBlank(),
+                                enabled = !isProcessing && passwordInput.isNotBlank() && uiState.lockoutRemainingSeconds <= 0L,
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .height(50.dp)

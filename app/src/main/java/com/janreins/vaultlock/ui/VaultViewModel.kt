@@ -397,14 +397,20 @@ class VaultViewModel @JvmOverloads constructor(
                 val remainingMs = securityPreferences.getLockoutRemainingMillis()
                 if (remainingMs > 0) {
                     val seconds = (remainingMs + 999) / 1000
-                    onResult(false, "Too many failed attempts. Try again in $seconds second(s).")
+                    val msg = "Too many failed attempts. Try again in $seconds second(s)."
+                    _uiState.update { it.copy(errorMessage = msg, lockoutRemainingSeconds = seconds) }
+                    startLockoutCountdown()
+                    onResult(false, msg)
                     return@launch
                 }
 
                 val oldKey = securityPreferences.verifyAndDeriveKey(currentPass.toCharArray())
                 if (oldKey == null) {
                     val delaySeconds = securityPreferences.recordFailedUnlockAttempt()
-                    onResult(false, "Current password is incorrect. Try again in $delaySeconds second(s).")
+                    val msg = "Current password is incorrect. Try again in $delaySeconds second(s)."
+                    _uiState.update { it.copy(errorMessage = msg, lockoutRemainingSeconds = delaySeconds) }
+                    startLockoutCountdown()
+                    onResult(false, msg)
                     return@launch
                 }
                 securityPreferences.resetFailedUnlockAttempts()
