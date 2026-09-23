@@ -309,6 +309,9 @@ class VaultViewModel @JvmOverloads constructor(
 
         val wrappedKey = securityPreferences.getWrappedMasterKey()
         if (wrappedKey == null) {
+            securityPreferences.disableBiometric()
+            BiometricHelper.deleteKeystoreKey()
+            _uiState.update { it.copy(isBiometricEnabled = false) }
             onResult(false, "Biometric credentials missing. Please unlock with master password.")
             return
         }
@@ -316,6 +319,10 @@ class VaultViewModel @JvmOverloads constructor(
         BiometricHelper.promptBiometricUnlock(
             activity = activity,
             wrappedKeyBase64 = wrappedKey,
+            onInvalidated = {
+                securityPreferences.disableBiometric()
+                _uiState.update { it.copy(isBiometricEnabled = false) }
+            },
             onSuccess = { secretKey ->
                 securityPreferences.resetFailedUnlockAttempts()
                 SessionManager.setKey(secretKey)
