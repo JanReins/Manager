@@ -10,7 +10,7 @@ VaultLock enforces end-to-end local encryption to keep your credentials safe on-
 
 - **Key Derivation (PBKDF2):** Master Key derived using `PBKDF2WithHmacSHA256` with **150,000 iterations** and a 256-bit key length.
 - **AES-256-GCM Encryption:** Sensitive fields (titles, usernames, passwords, notes, TOTP secrets) are individually encrypted with `AES/GCM/NoPadding` using a cryptographically secure random 12-byte IV for every write operation.
-- **Biometric Unlock:** Android `BiometricPrompt` with Hardware KeyStore wrapping to securely preserve and retrieve the master session key without compromising security.
+- **Biometric Unlock:** Android `BiometricPrompt` with Hardware KeyStore wrapping to securely preserve and retrieve the master session key without compromising security. Biometric re-enrollment is required when device biometric settings change or keystore credentials are invalidated.
 - **Unlock Throttling & Rate Limiting:** Consecutive failed master-password attempts trigger exponential backoff delays (1s, 2s, 4s, 8s, 16s, 32s, capped at 60s) persisted in `EncryptedSharedPreferences` to mitigate brute-force attacks.
 - **Memory Hardening & Session Wiping:** Session lock clears active key references, zeroizes temporary key byte arrays, and invokes `Destroyable.destroy()` where supported. Note that due to JVM/Android garbage collection and immutable `SecretKeySpec` internal fields, full key zeroization in managed memory is best-effort and immutable copies may persist until collected by GC.
 - **100% Offline Architecture:** VaultLock does not declare `android.permission.INTERNET`. Zero network dependencies, zero cloud sync, and zero external telemetry.

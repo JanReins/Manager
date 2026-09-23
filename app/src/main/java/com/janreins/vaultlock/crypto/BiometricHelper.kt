@@ -34,6 +34,28 @@ object BiometricHelper {
         return biometricManager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG) == BiometricManager.BIOMETRIC_SUCCESS
     }
 
+    fun buildKeyGenParameterSpec(alias: String = KEYSTORE_ALIAS): KeyGenParameterSpec {
+        val builder = KeyGenParameterSpec.Builder(
+            alias,
+            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+        )
+            .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            .setKeySize(256)
+            .setUserAuthenticationRequired(true)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            builder.setUserAuthenticationParameters(0, KeyProperties.AUTH_BIOMETRIC_STRONG)
+        } else {
+            @Suppress("DEPRECATION")
+            builder.setUserAuthenticationValidityDurationSeconds(-1)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            builder.setInvalidatedByBiometricEnrollment(true)
+        }
+        return builder.build()
+    }
+
     private fun getOrCreateKeystoreKey(): SecretKey {
         val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
         if (!keyStore.containsAlias(KEYSTORE_ALIAS)) {
@@ -41,26 +63,39 @@ object BiometricHelper {
                 KeyProperties.KEY_ALGORITHM_AES,
                 ANDROID_KEYSTORE
             )
-            val builder = KeyGenParameterSpec.Builder(
-                KEYSTORE_ALIAS,
-                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
-            )
-                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-                .setKeySize(256)
-                .setUserAuthenticationRequired(true)
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                builder.setUserAuthenticationParameters(0, KeyProperties.AUTH_BIOMETRIC_STRONG)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                builder.setInvalidatedByBiometricEnrollment(true)
-            }
-
-            keyGenerator.init(builder.build())
+            keyGenerator.init(buildKeyGenParameterSpec(KEYSTORE_ALIAS))
             keyGenerator.generateKey()
         }
         return (keyStore.getEntry(KEYSTORE_ALIAS, null) as KeyStore.SecretKeyEntry).secretKey
+    }
+
+    private fun getKeystoreKey(): SecretKey? {
+        return try {
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            if (!keyStore.containsAlias(KEYSTORE_ALIAS)) {
+                null
+            } else {
+                val entry = keyStore.getEntry(KEYSTORE_ALIAS, null) as? KeyStore.SecretKeyEntry
+                entry?.secretKey
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun isKeyPermanentlyInvalidated(e: Throwable): Boolean {
+        var cause: Throwable? = e
+        while (cause != null) {
+            if (cause is android.security.keystore.KeyPermanentlyInvalidatedException) {
+                return true
+            }
+            val msg = cause.message?.lowercase() ?: ""
+            if (msg.contains("key permanently invalidated") || msg.contains("key invalidated")) {
+                return true
+            }
+            cause = cause.cause
+        }
+        return false
     }
 
     fun deleteKeystoreKey() {
@@ -161,6 +196,7 @@ object BiometricHelper {
         title: String = "Unlock VaultLock",
         subtitle: String = "Verify identity with strong biometrics",
         negativeButtonText: String = "Use Master Password",
+        onInvalidated: (() -> Unit)? = null,
         onSuccess: (SecretKey) -> Unit,
         onError: (String) -> Unit
     ) {
@@ -178,7 +214,14 @@ object BiometricHelper {
             val cipherText = ByteArray(cipherTextSize)
             System.arraycopy(combined, GCM_IV_LENGTH, cipherText, 0, cipherTextSize)
 
-            val keystoreKey = getOrCreateKeystoreKey()
+            val keystoreKey = getKeystoreKey()
+            if (keystoreKey == null) {
+                deleteKeystoreKey()
+                onInvalidated?.invoke()
+                onError("Biometric key missing. Please unlock with Master Password and re-enable biometric unlock.")
+                return
+            }
+
             val cipher = Cipher.getInstance(AES_GCM_CIPHER)
             val spec = GCMParameterSpec(GCM_TAG_LENGTH, iv)
             cipher.init(Cipher.DECRYPT_MODE, keystoreKey, spec)
@@ -196,12 +239,21 @@ object BiometricHelper {
                             onError("Biometric authentication missing authenticated cipher")
                             return
                         }
+                        var decryptedKeyBytes: ByteArray? = null
                         try {
-                            val decryptedKeyBytes = authenticatedCipher.doFinal(cipherText)
+                            decryptedKeyBytes = authenticatedCipher.doFinal(cipherText)
                             val secretKey = SecretKeySpec(decryptedKeyBytes, "AES")
                             onSuccess(secretKey)
                         } catch (e: Exception) {
-                            onError("Failed to unwrap key: ${e.localizedMessage}")
+                            if (isKeyPermanentlyInvalidated(e)) {
+                                deleteKeystoreKey()
+                                onInvalidated?.invoke()
+                                onError("Biometric credentials invalidated. Please unlock with Master Password and re-enable biometric unlock.")
+                            } else {
+                                onError("Failed to unwrap key: ${e.localizedMessage}")
+                            }
+                        } finally {
+                            decryptedKeyBytes?.fill(0)
                         }
                     }
 
@@ -232,7 +284,13 @@ object BiometricHelper {
 
             prompt.authenticate(promptInfo, cryptoObject)
         } catch (e: Exception) {
-            onError("Biometric setup failed: ${e.localizedMessage}")
+            if (isKeyPermanentlyInvalidated(e)) {
+                deleteKeystoreKey()
+                onInvalidated?.invoke()
+                onError("Biometric credentials invalidated. Please unlock with Master Password and re-enable biometric unlock.")
+            } else {
+                onError("Biometric setup failed: ${e.localizedMessage}")
+            }
         }
     }
 }
