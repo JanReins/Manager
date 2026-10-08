@@ -2,6 +2,7 @@ package com.janreins.vaultlock
 
 import android.app.Application
 import android.content.Context
+import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.janreins.vaultlock.crypto.SessionManager
 import com.janreins.vaultlock.data.SecurityPreferences
@@ -44,7 +45,9 @@ class MasterPasswordChangeTest {
         application = ApplicationProvider.getApplicationContext()
         val testPrefs = application.getSharedPreferences("test_vaultlock_prefs", Context.MODE_PRIVATE)
         securityPreferences = SecurityPreferences(application, customPrefs = testPrefs)
-        database = VaultDatabase.getInstance(application)
+        // Isolated DB: one test closes it to force a failure, which must not poison the app singleton.
+        database = Room.inMemoryDatabaseBuilder(application, VaultDatabase::class.java)
+            .allowMainThreadQueries().build()
         repository = VaultRepository(database.vaultDao(), securityPreferences)
     }
 
