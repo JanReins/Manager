@@ -2,8 +2,8 @@
 
 Reviewed commit: `bdedd3b` (the repository's default branch when cloned).
 
-**Status: improvements prepared; not ready for production credential storage.**
-The release blockers below need repairs in components protected by `AGENTS.md`.
+**Status: Ready for a first debug APK release; portable backup recovery remains a known limitation.**
+Portable backup recovery remains open; completed repairs are marked Fixed below.
 The focused data-safety follow-up below modifies protected components with explicit authorization. Proposed changes and current CI results
 are available in [PR #6](https://github.com/JanReins/Manager/pull/6).
 
@@ -35,13 +35,13 @@ are available in [PR #6](https://github.com/JanReins/Manager/pull/6).
 | Priority | Finding and evidence | Required repair |
 | --- | --- | --- |
 | Critical | Backups cannot recover a fresh installation. `createEncryptedBackupPayload` encrypts with the session key and writes only IV+ciphertext. The original PBKDF2 salt is absent. A new installation generates another salt even with the same password; a password change discards the prior salt. | Introduce a versioned, self-contained backup envelope with salt and bounded KDF parameters. Derive a separate backup key from an explicitly entered backup password; authenticate its header. Restore must accept that password and encrypt recovered entries with the destination vault's current key. Keep legacy imports explicitly limited to the original key. |
-| Critical | Failed decryption can permanently replace credentials with blank data. `VaultEntryEntity.toDomain` catches errors and returns `[Decryption Failed]` with empty credentials. Both `reEncryptAll` and export consume those placeholder objects as valid data. | Use strict decryption for every write/export/rotation operation and abort the entire operation on any authentication failure. Give the UI an explicit unreadable-entry state that cannot be saved over accidentally. Preserve corrupt ciphertext for recovery. |
+| Fixed | Silent decryption failures previously allowed blank credentials to overwrite stored data. | Strict decryption now aborts rotation, export, and existing-entry updates on failure, preserving ciphertext (earlier PRs). |
 | Fixed | Master-password rotation previously stranded rows if the process died between the Room batch and preference commit. | Pending credentials are committed before rotation; password unlock checks strict row decryption and clears or promotes the journal atomically. Commit failures retain the new session key and recovery metadata. |
-| High | Lock/unlock does not refresh or discard the decrypted entry flow. `getAllEntries` observes only Room emissions and samples the session key at that time. Changing `SessionManager.isUnlocked` alone does not recompute entries. The ViewModel's session observer only changes a Boolean, so unlocked credentials can remain in its lists after locking, and a new unlock can leave placeholder entries visible. | Combine session state with database emissions or switch collection on each session. Clear decrypted UI lists, search state, generated passwords, and entry selections synchronously when locking. Guard against a decryption result arriving after its session expired. Test lock/unlock without any database writes. |
-| High | Password rotation can leave stale biometric credentials. If biometrics were enabled but `activity` is null, the old wrapped key survives the master-password change. Re-enrollment can also leave stale persisted tokens until its callback completes. | Atomically invalidate old biometric enrollment during rotation. Permit re-enrollment only after the new credentials are durable. Verify the unwrapped key belongs to the current vault before activating a session. Test null activity, cancellation, invalidation, and interrupted enrollment. |
-| High | Several mutation coroutines have uncaught errors. `saveEntry`, `toggleFavorite`, and `deleteEntry` launch repository operations without error handling. Session expiry during editing or IO failure can terminate the app. Key derivation also runs directly on the main dispatcher. | Add guarded operations and explicit success/error results; keep failed forms open with an error. Run password derivation on a worker dispatcher and serialize authentication/rotation to prevent overlapping work. Handle coroutine cancellation separately. |
-| Medium | Background clipboard clearing is not reliable. The delayed runnable attempts to read/write the clipboard after backgrounding, when Android may deny clipboard access, and lock does not attempt immediate clearing. Its closure retains copied plaintext while waiting. | Track ownership of the copied clip, attempt clearing while foregrounded at lock, cancel and release pending plaintext references, and retry ownership-aware clearing on foreground. Never erase a newer clip copied by another app. Validate on Android 26, 29, and 33+. |
-| Medium | Version 1 migration uses `ALTER TABLE ... RENAME COLUMN`, unavailable on older SQLite versions shipped with supported Android 8/9 devices. | Replace the rename with a compatible create/copy/drop migration; test real legacy schemas and legacy title handling. Export Room schemas and add migration tests. |
+| Fixed | Entry loading previously ignored lock/unlock transitions. | Session-reactive entry loading and sensitive ViewModel state clearing now refresh entries on unlock and discard them on lock (earlier PRs). |
+| Fixed | Password rotation previously left stale biometric credentials. | Rotation now purges the old wrapped key before re-enrollment; null Activity leaves biometric disabled; unlock verifies the unwrapped key against the current verifier (earlier PRs). |
+| Fixed | Mutation coroutines previously crashed on session expiry / IO failure; PBKDF2 ran on main. | Mutations are guarded with user-visible errors; KDF runs on a worker dispatcher (earlier PRs). |
+| Fixed (PR #10) | Clipboard clearing previously retained plaintext and skipped lock. | Ownership-aware clearing without retaining plaintext; clear on lock/timeout; background keeps clip for pasting (PR #10). |
+| Fixed | Version 1 migration used SQLite `RENAME COLUMN`, unsupported on Android API 26–29. | This PR rebuilds and copies the v2 table, preserving all stored fields. Added a Robolectric migration regression for APIs 26–29 without new dependencies. |
 
 The protected repair scope is `CryptoManager`, `SessionManager`, `SecurityPreferences`,
 `VaultRepository`, `VaultDatabase` and migrations, `BiometricHelper`, plus ViewModel
@@ -50,6 +50,8 @@ reviewed for locale-stable numeric formatting and malformed Base32 handling befo
 The offline policy remains mandatory: no INTERNET permission, network client, sync, or telemetry.
 
 ## Validation and limits
+
+- This migration PR: verified with `testDebugUnitTest lintDebug assembleDebug`.
 
 - Attempted: `./gradlew testDebugUnitTest assembleDebug lintDebug --no-daemon`.
 - Blocked before compilation: Gradle 9.3.1 could not download from `services.gradle.org`
