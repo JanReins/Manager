@@ -4,7 +4,8 @@ Reviewed commit: `bdedd3b` (the repository's default branch when cloned).
 
 **Status: improvements prepared; not ready for production credential storage.**
 The release blockers below need repairs in components protected by `AGENTS.md`.
-No protected implementation was changed in this revision. No GitHub branch or PR was published.
+No protected implementation was changed in this revision. Proposed changes and current CI results
+are available in [PR #6](https://github.com/JanReins/Manager/pull/6).
 
 ## Implemented improvements
 
