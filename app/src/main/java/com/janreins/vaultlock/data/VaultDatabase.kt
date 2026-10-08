@@ -40,7 +40,34 @@ abstract class VaultDatabase : RoomDatabase() {
                 cursor.close()
 
                 if (hasTitle && !hasEncryptedTitle) {
-                    db.execSQL("ALTER TABLE vault_entries RENAME COLUMN title TO encrypted_title")
+                    // Rebuild the v2 table: RENAME COLUMN is unavailable on API 26–29.
+                    db.execSQL("""
+                        CREATE TABLE vault_entries_new (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            encrypted_title TEXT NOT NULL,
+                            encrypted_username TEXT NOT NULL,
+                            encrypted_password TEXT NOT NULL,
+                            encrypted_url TEXT NOT NULL,
+                            encrypted_notes TEXT NOT NULL,
+                            category TEXT NOT NULL,
+                            is_favorite INTEGER NOT NULL,
+                            created_at INTEGER NOT NULL,
+                            updated_at INTEGER NOT NULL
+                        )
+                    """.trimIndent())
+                    db.execSQL("""
+                        INSERT INTO vault_entries_new (
+                            id, encrypted_title, encrypted_username, encrypted_password,
+                            encrypted_url, encrypted_notes, category, is_favorite,
+                            created_at, updated_at
+                        )
+                        SELECT id, title, encrypted_username, encrypted_password,
+                            encrypted_url, encrypted_notes, category, is_favorite,
+                            created_at, updated_at
+                        FROM vault_entries
+                    """.trimIndent())
+                    db.execSQL("DROP TABLE vault_entries")
+                    db.execSQL("ALTER TABLE vault_entries_new RENAME TO vault_entries")
                 } else if (!hasEncryptedTitle) {
                     db.execSQL("ALTER TABLE vault_entries ADD COLUMN encrypted_title TEXT NOT NULL DEFAULT ''")
                 }
