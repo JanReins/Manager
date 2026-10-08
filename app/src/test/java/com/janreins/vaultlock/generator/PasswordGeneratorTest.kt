@@ -9,6 +9,40 @@ import org.junit.Test
 class PasswordGeneratorTest {
 
     @Test
+    fun `pronounceable generation respects all charset combinations and bounds`() {
+        for (mask in 0..15) {
+            for (requestedLength in listOf(Int.MIN_VALUE, 8, 16, 64, Int.MAX_VALUE)) {
+                val options = GeneratorOptions(
+                    length = requestedLength,
+                    includeUppercase = mask and 1 != 0,
+                    includeLowercase = mask and 2 != 0,
+                    includeNumbers = mask and 4 != 0,
+                    includeSymbols = mask and 8 != 0,
+                    easyToSay = true,
+                    easyToRead = true
+                )
+                repeat(10) {
+                    val password = PasswordGenerator.generate(options)
+                    assertEquals(requestedLength.coerceIn(8, 64), password.length)
+                    assertEquals(options.includeUppercase, password.any { it.isUpperCase() })
+                    assertEquals(options.includeLowercase || mask == 0, password.any { it.isLowerCase() })
+                    assertEquals(options.includeNumbers, password.any { it.isDigit() })
+                    assertEquals(options.includeSymbols, password.any { !it.isLetterOrDigit() })
+                    assertFalse(password.any { it in "1lI0O" })
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `obvious repeated common and short passwords are weak`() {
+        for (password in listOf("aaaaaaaaaaaaaaaaaaaa", "Ab1!Ab1!Ab1!Ab1!", "Password123!", "qwertyuiop", "1234567890", "Aa1!")) {
+            assertEquals("Weak", PasswordGenerator.evaluateStrength(password).label)
+        }
+        assertEquals("Very strong", PasswordGenerator.evaluateStrength("K9#mP!2xL\$8vQ@1z").label)
+    }
+
+    @Test
     fun `generate respects length bounds between 8 and 64`() {
         // Test lower bound enforcement
         val shortOptions = GeneratorOptions(length = 4)

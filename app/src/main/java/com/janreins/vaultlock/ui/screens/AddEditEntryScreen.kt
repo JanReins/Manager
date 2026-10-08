@@ -49,6 +49,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -66,6 +67,7 @@ import androidx.compose.ui.unit.sp
 import com.janreins.vaultlock.data.VaultEntry
 import com.janreins.vaultlock.generator.PasswordGenerator
 import com.janreins.vaultlock.ui.VaultViewModel
+import com.janreins.vaultlock.ui.EntryValidation
 import com.janreins.vaultlock.ui.theme.Amber400
 import com.janreins.vaultlock.ui.theme.Amber500
 import com.janreins.vaultlock.ui.theme.RedError
@@ -78,6 +80,10 @@ fun AddEditEntryScreen(
     onNavigateBack: () -> Unit
 ) {
     val isEdit = entryId != null && entryId > 0
+    val uiState by viewModel.uiState.collectAsState()
+    val existingEntry = uiState.allEntries.find { it.id == entryId }
+    var loadedEntryId by remember(entryId) { mutableStateOf<Long?>(null) }
+    var createdAt by remember(entryId) { mutableStateOf(System.currentTimeMillis()) }
 
     var title by remember { mutableStateOf("") }
     var username by remember { mutableStateOf("") }
@@ -91,12 +97,14 @@ fun AddEditEntryScreen(
     var isPasswordVisible by remember { mutableStateOf(false) }
     var showGeneratorSheet by remember { mutableStateOf(false) }
     var titleError by remember { mutableStateOf(false) }
+    var totpError by remember { mutableStateOf(false) }
+    var isTotpVisible by remember { mutableStateOf(false) }
 
     // Load existing entry if editing
-    LaunchedEffect(entryId) {
+    LaunchedEffect(entryId, existingEntry) {
         if (entryId != null && entryId > 0) {
-            val existing = viewModel.uiState.value.allEntries.find { it.id == entryId }
-            if (existing != null) {
+            val existing = existingEntry
+            if (existing != null && loadedEntryId != entryId) {
                 title = existing.title
                 username = existing.username
                 password = existing.password
@@ -105,6 +113,8 @@ fun AddEditEntryScreen(
                 totpSecret = existing.totpSecret
                 category = existing.category
                 isFavorite = existing.isFavorite
+                createdAt = existing.createdAt
+                loadedEntryId = entryId
             }
         }
     }
@@ -282,6 +292,7 @@ fun AddEditEntryScreen(
                             }
                         },
                         visualTransformation = if (isPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrect = false),
                         singleLine = true,
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = Amber400,
@@ -320,10 +331,27 @@ fun AddEditEntryScreen(
                     // TOTP Secret Field (2FA Authenticator)
                     OutlinedTextField(
                         value = totpSecret,
-                        onValueChange = { totpSecret = it },
+                        onValueChange = {
+                            totpSecret = it
+                            totpError = false
+                        },
                         label = { Text("TOTP Secret Key (Optional 2FA)") },
                         leadingIcon = {
                             Icon(Icons.Default.Key, null, tint = Amber400)
+                        },
+                        trailingIcon = {
+                            IconButton(onClick = { isTotpVisible = !isTotpVisible }) {
+                                Icon(
+                                    if (isTotpVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                    contentDescription = if (isTotpVisible) "Hide TOTP secret" else "Show TOTP secret"
+                                )
+                            }
+                        },
+                        visualTransformation = if (isTotpVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrect = false),
+                        isError = totpError,
+                        supportingText = {
+                            Text(if (totpError) "Enter a valid Base32 secret (A–Z, 2–7)." else "Raw secret only; SHA-1, 6 digits, 30 seconds.")
                         },
                         singleLine = true,
                         colors = OutlinedTextFieldDefaults.colors(
@@ -386,6 +414,8 @@ fun AddEditEntryScreen(
                 onClick = {
                     if (title.isBlank()) {
                         titleError = true
+                    } else if (!EntryValidation.isValidTotpSecret(totpSecret)) {
+                        totpError = true
                     } else {
                         val entry = VaultEntry(
                             id = entryId ?: 0L,
@@ -394,10 +424,10 @@ fun AddEditEntryScreen(
                             password = password,
                             url = url.trim(),
                             notes = notes.trim(),
-                            totpSecret = totpSecret.trim(),
+                            totpSecret = EntryValidation.normalizeTotpSecret(totpSecret),
                             category = category,
                             isFavorite = isFavorite,
-                            createdAt = if (isEdit) 0L else System.currentTimeMillis(),
+                            createdAt = createdAt,
                             updatedAt = System.currentTimeMillis()
                         )
                         viewModel.saveEntry(entry) {
@@ -405,6 +435,7 @@ fun AddEditEntryScreen(
                         }
                     }
                 },
+                enabled = !isEdit || loadedEntryId == entryId,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(54.dp)
