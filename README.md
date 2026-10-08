@@ -19,12 +19,12 @@ VaultLock uses local encryption to protect credentials stored on-device:
 
 ## ✨ Features (v1.1)
 
-- **2FA Authenticator (TOTP):** Pure Kotlin HMAC-SHA1 algorithm (RFC 6238) providing live 6-digit TOTP codes and countdown timers for entry items.
+- **2FA Authenticator (TOTP):** Raw Base32 secrets and `otpauth://totp` URIs (RFC 6238), with SHA1/SHA256/SHA512, 6–8 digits, custom periods (15–120 seconds), and live countdowns.
 - **Duplicate Password Warnings:** In-app visual warnings flagging entries reusing passwords across different services.
 - **Encrypted Exports:** Save an encrypted file directly through Android's document picker. Imports are limited to 16 MiB and add entries to the current vault.
 - **Biometric Authentication:** Hardware-backed fingerprint / face unlock.
 - **Auto-Lock Timer:** Automatic locking on inactivity or app backgrounding.
-- **Clipboard Masking:** Sensitive clip data flags (Android 13+) with automatic 30-second clipboard clearing.
+- **Clipboard Masking:** Sensitive clip data flags (Android 13+) with clipboard clearing after 30 seconds and on vault lock, while preserving clips copied by other apps.
 
 ---
 

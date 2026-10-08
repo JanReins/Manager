@@ -400,7 +400,7 @@ fun VaultEntryCard(
             while (true) {
                 val now = System.currentTimeMillis()
                 totpCode = TotpHelper.generateTotp(entry.totpSecret, now)
-                totpRemainingSeconds = TotpHelper.getRemainingSeconds(now)
+                totpRemainingSeconds = TotpHelper.getRemainingSeconds(entry.totpSecret, now)
                 delay(1000L)
             }
         }
