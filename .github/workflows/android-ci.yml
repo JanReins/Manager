@@ -5,6 +5,10 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -24,5 +28,35 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
-      - name: Run unit tests
-        run: ./gradlew test
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build tools
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Run unit tests, lint, and build debug APK
+        run: ./gradlew testDebugUnitTest lintDebug assembleDebug --stacktrace
+
+      - name: Check APK stays offline
+        shell: bash
+        run: |
+          permissions_output=$("$ANDROID_HOME/build-tools/36.0.0/aapt" dump permissions app/build/outputs/apk/debug/app-debug.apk)
+          if rg -q 'android.permission.(INTERNET|ACCESS_NETWORK_STATE)' <<< "$permissions_output"; then
+            echo "Offline policy violated: network permission in packaged APK"
+            exit 1
+          fi
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-check-reports
+          path: |
+            app/build/reports/tests/
+            app/build/reports/lint-results-debug.*
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaultlock-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk

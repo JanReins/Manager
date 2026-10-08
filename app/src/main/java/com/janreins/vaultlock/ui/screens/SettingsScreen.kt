@@ -1,7 +1,5 @@
 package com.janreins.vaultlock.ui.screens
 
-import android.content.Context
-import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -72,7 +70,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
-import androidx.core.content.FileProvider
+import com.janreins.vaultlock.ui.BackupFileIO
 import com.janreins.vaultlock.ui.VaultUiState
 import com.janreins.vaultlock.ui.VaultViewModel
 import com.janreins.vaultlock.ui.theme.Amber400
@@ -80,8 +78,9 @@ import com.janreins.vaultlock.ui.theme.Amber500
 import com.janreins.vaultlock.ui.theme.EmeraldSuccess
 import com.janreins.vaultlock.ui.theme.RedError
 import kotlinx.coroutines.launch
-import java.io.File
-import java.io.FileOutputStream
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -100,28 +99,60 @@ fun SettingsScreen(
     var showAutoLockDialog by remember { mutableStateOf(false) }
     var showThemeDialog by remember { mutableStateOf(false) }
     var showWipeConfirmationDialog by remember { mutableStateOf(false) }
+    var pendingBackup by remember { mutableStateOf<ByteArray?>(null) }
+    var backupBusy by remember { mutableStateOf(false) }
+
+    val saveBackupLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream")
+    ) { uri ->
+        val bytes = pendingBackup
+        pendingBackup = null
+        coroutineScope.launch {
+            try {
+                if (uri != null && bytes != null) {
+                    withContext(Dispatchers.IO) {
+                        checkNotNull(context.contentResolver.openOutputStream(uri, "wt")) {
+                            "Cannot open the backup destination."
+                        }.use { it.write(bytes) }
+                    }
+                    snackbarHostState.showSnackbar("Encrypted backup saved")
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                snackbarHostState.showSnackbar("Backup could not be saved. Try another destination.")
+            } finally {
+                bytes?.fill(0)
+                backupBusy = false
+            }
+        }
+    }
 
     // File Picker for importing encrypted backup
     val restoreBackupLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
-            try {
-                val inputStream = context.contentResolver.openInputStream(uri)
-                val bytes = inputStream?.readBytes()
-                inputStream?.close()
-                if (bytes != null) {
-                    viewModel.importBackup(bytes) { success, count, message ->
-                        coroutineScope.launch {
-                            snackbarHostState.showSnackbar(message)
-                        }
+            coroutineScope.launch {
+                try {
+                    val bytes = withContext(Dispatchers.IO) {
+                        checkNotNull(context.contentResolver.openInputStream(uri)) {
+                            "Cannot open the selected backup."
+                        }.use { BackupFileIO.readBounded(it) }
                     }
-                }
-            } catch (e: Exception) {
-                coroutineScope.launch {
-                    snackbarHostState.showSnackbar("Failed to read file: ${e.message}")
+                    viewModel.importBackup(bytes) { _, _, message ->
+                        backupBusy = false
+                        coroutineScope.launch { snackbarHostState.showSnackbar(message) }
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    backupBusy = false
+                    snackbarHostState.showSnackbar(e.message ?: "Failed to read backup file")
                 }
             }
+        } else {
+            backupBusy = false
         }
     }
 
@@ -310,11 +341,29 @@ fun SettingsScreen(
                         title = "Export Encrypted Backup",
                         subtitle = "Creates an offline AES-256-GCM encrypted file",
                         onClick = {
-                            viewModel.exportBackup { backupBytes ->
-                                if (backupBytes != null) {
+                            if (!backupBusy) {
+                              backupBusy = true
+                              viewModel.exportBackup { backupBytes ->
+                                if (backupBytes != null && backupBytes.size <= BackupFileIO.MAX_BACKUP_BYTES) {
+                                  try {
+                                    pendingBackup = backupBytes
                                     viewModel.suppressNextBackgroundLock()
-                                    shareBackupFile(context, backupBytes)
+                                    saveBackupLauncher.launch("VaultLock_Backup_${System.currentTimeMillis()}.vault")
+                                  } catch (_: Exception) {
+                                    pendingBackup = null
+                                    backupBytes.fill(0)
+                                    backupBusy = false
+                                    coroutineScope.launch { snackbarHostState.showSnackbar("Unable to open the save picker") }
+                                  }
+                                } else {
+                                    backupBusy = false
+                                    val message = if (backupBytes != null) {
+                                        backupBytes.fill(0)
+                                        "Backup exceeds the supported 16 MiB size."
+                                    } else "Backup failed. Unlock the vault and try again."
+                                    coroutineScope.launch { snackbarHostState.showSnackbar(message) }
                                 }
+                              }
                             }
                         },
                         testTag = "setting_export_backup"
@@ -324,15 +373,30 @@ fun SettingsScreen(
                     SettingsRowItem(
                         icon = Icons.Default.Download,
                         title = "Restore Encrypted Backup",
-                        subtitle = "Restore passwords from a VaultLock backup file",
+                        subtitle = "Adds entries to this vault; repeated restores create duplicates",
                         onClick = {
+                          if (!backupBusy) {
+                            backupBusy = true
+                            try {
                             viewModel.suppressNextBackgroundLock()
                             restoreBackupLauncher.launch("*/*")
+                            } catch (_: Exception) {
+                                backupBusy = false
+                                coroutineScope.launch { snackbarHostState.showSnackbar("Unable to open the restore picker") }
+                            }
+                          }
                         },
                         testTag = "setting_restore_backup"
                     )
                 }
             }
+
+            Text(
+                text = "Current backups only restore into the same vault with its original master key. Reinstalling, wiping the app, or changing the master password makes these backups unusable. Save to a local folder to keep the file offline.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 8.dp)
+            )
 
             Spacer(modifier = Modifier.height(20.dp))
 
@@ -701,42 +765,4 @@ fun ThemePickerDialog(
             }
         }
     )
-}
-
-private fun shareBackupFile(context: Context, backupBytes: ByteArray) {
-    try {
-        val backupDir = File(context.cacheDir, "backups")
-        if (!backupDir.exists()) backupDir.mkdirs()
-
-        val timestamp = System.currentTimeMillis()
-        val file = File(backupDir, "VaultLock_Backup_$timestamp.vault")
-        val fos = FileOutputStream(file)
-        fos.write(backupBytes)
-        fos.flush()
-        fos.close()
-
-        val fileUri: Uri = FileProvider.getUriForFile(
-            context,
-            "${context.packageName}.fileprovider",
-            file
-        )
-
-        val intent = Intent(Intent.ACTION_SEND).apply {
-            type = "application/octet-stream"
-            putExtra(Intent.EXTRA_STREAM, fileUri)
-            putExtra(Intent.EXTRA_SUBJECT, "VaultLock Encrypted Backup")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-
-        context.startActivity(Intent.createChooser(intent, "Save or Share Encrypted Backup"))
-    } catch (e: Exception) {
-        // Fallback to text share if FileProvider is unavailable
-        val base64 = android.util.Base64.encodeToString(backupBytes, android.util.Base64.NO_WRAP)
-        val textIntent = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_TEXT, base64)
-            putExtra(Intent.EXTRA_SUBJECT, "VaultLock Encrypted Backup (Base64)")
-        }
-        context.startActivity(Intent.createChooser(textIntent, "Save Encrypted Backup"))
-    }
 }

@@ -6,7 +6,7 @@ VaultLock is a privacy-first, fully offline personal password manager for Androi
 
 ## 🔒 Security Model
 
-VaultLock enforces end-to-end local encryption to keep your credentials safe on-device:
+VaultLock uses local encryption to protect credentials stored on-device:
 
 - **Key Derivation (PBKDF2):** Master Key derived using `PBKDF2WithHmacSHA256` with **150,000 iterations** and a 256-bit key length.
 - **AES-256-GCM Encryption:** Sensitive fields (titles, usernames, passwords, notes, TOTP secrets) are individually encrypted with `AES/GCM/NoPadding` using a cryptographically secure random 12-byte IV for every write operation.
@@ -21,7 +21,7 @@ VaultLock enforces end-to-end local encryption to keep your credentials safe on-
 
 - **2FA Authenticator (TOTP):** Pure Kotlin HMAC-SHA1 algorithm (RFC 6238) providing live 6-digit TOTP codes and countdown timers for entry items.
 - **Duplicate Password Warnings:** In-app visual warnings flagging entries reusing passwords across different services.
-- **Encrypted Backups:** On-demand encrypted JSON database export & restore.
+- **Encrypted Exports:** Save an encrypted file directly through Android's document picker. Imports are limited to 16 MiB and add entries to the current vault.
 - **Biometric Authentication:** Hardware-backed fingerprint / face unlock.
 - **Auto-Lock Timer:** Automatic locking on inactivity or app backgrounding.
 - **Clipboard Masking:** Sensitive clip data flags (Android 13+) with automatic 30-second clipboard clearing.
@@ -39,10 +39,32 @@ VaultLock enforces end-to-end local encryption to keep your credentials safe on-
 ./gradlew test
 ```
 
+### Build and check a debug APK
+```bash
+./gradlew testDebugUnitTest lintDebug assembleDebug
+```
+Android's default debug keystore is generated automatically; no repository keystore is needed.
+The Android CI workflow runs these checks, verifies that the APK has no network permissions,
+and uploads the debug APK and reports. Debug APKs are for testing and use a different signing
+key from a production installation; do not uninstall an existing vault to install one.
+
+### Current recovery limitations
+Existing backup files are encrypted with the installation's master key and do not include its
+derivation salt. They restore only into the same vault using the original key. A fresh installation,
+app reset, or master-password change cannot recover those files. Restore currently appends entries,
+so importing a file repeatedly creates duplicates. Keep exports in local storage to avoid sending
+them through a document provider that syncs to the cloud.
+
+The [review and repair plan](REVIEW.md) lists unresolved security and recovery issues.
+This revision is not ready to be the only store of important credentials until the release
+blockers there are fixed and Android/device checks pass.
+
 ### Build Release APK
 ```bash
 ./gradlew assembleRelease
 ```
+Release signing requires `KEYSTORE_PATH`, `STORE_PASSWORD`, and `KEY_PASSWORD` for your existing
+upload keystore (alias `upload`). Keep the same production signing key for updates; never commit it.
 
 ---
 

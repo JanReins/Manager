@@ -38,10 +38,6 @@ object PasswordGenerator {
     )
 
     fun generate(options: GeneratorOptions): String {
-        if (options.easyToSay) {
-            return generateEasyToSay(options.length, options.includeUppercase, options.includeNumbers)
-        }
-
         val upperPool = if (options.easyToRead) UPPERCASE_EASY else UPPERCASE
         val lowerPool = if (options.easyToRead) LOWERCASE_EASY else LOWERCASE
         val numberPool = if (options.easyToRead) NUMBERS_EASY else NUMBERS
@@ -58,6 +54,9 @@ object PasswordGenerator {
         }
 
         val length = options.length.coerceIn(8, 64)
+        if (options.easyToSay && (options.includeUppercase || options.includeLowercase)) {
+            return generateEasyToSay(options, length, selectedPools)
+        }
         val passwordChars = mutableListOf<Char>()
 
         // Ensure at least one character from each selected category
@@ -76,41 +75,49 @@ object PasswordGenerator {
         return passwordChars.joinToString("")
     }
 
-    private fun generateEasyToSay(targetLength: Int, uppercase: Boolean, numbers: Boolean): String {
-        val sb = StringBuilder()
+    private fun generateEasyToSay(options: GeneratorOptions, length: Int, pools: List<String>): String {
+        val chars = CharArray(length)
         var isVowel = random.nextBoolean()
-
-        while (sb.length < targetLength) {
-            val nextChar = if (isVowel) {
-                VOWELS[random.nextInt(VOWELS.size)]
-            } else {
-                CONSONANTS[random.nextInt(CONSONANTS.size)]
-            }
-            sb.append(nextChar)
+        val vowels = VOWELS.joinToString("").filter {
+            !options.easyToRead || it.uppercaseChar() !in "IO"
+        }
+        val consonants = CONSONANTS.joinToString("")
+        for (i in chars.indices) {
+            val pool = if (isVowel) vowels else consonants
+            val letter = pool[random.nextInt(pool.length)]
+            chars[i] = if (options.includeUppercase &&
+                (!options.includeLowercase || random.nextBoolean())) letter.uppercaseChar() else letter
             isVowel = !isVowel
         }
-
-        var result = sb.toString().take(targetLength)
-        if (uppercase) {
-            // Capitalize random syllables
-            val charArray = result.toCharArray()
-            for (i in charArray.indices step 3) {
-                charArray[i] = charArray[i].uppercaseChar()
-            }
-            result = String(charArray)
+        // Reserve distinct positions so every selected class is present, even
+        // with both letter cases, symbols, and readability options enabled.
+        val positions = chars.indices.toMutableList().apply { shuffle(random) }
+        pools.forEachIndexed { index, pool ->
+            val pronounceablePool = if (pool.any { it.isLetter() }) {
+                pool.filter { it.lowercaseChar() in vowels + consonants }
+            } else pool
+            chars[positions[index]] = pronounceablePool[random.nextInt(pronounceablePool.length)]
         }
-
-        if (numbers && result.length >= 4) {
-            val num = (random.nextInt(90) + 10).toString()
-            result = result.dropLast(2) + num
-        }
-
-        return result
+        return String(chars)
     }
 
     fun evaluateStrength(password: String): PasswordStrength {
         if (password.isEmpty()) {
             return PasswordStrength(0f, "Empty", 0xFF64748B)
+        }
+
+        // This meter is a heuristic, not a promise of resistance to guessing.
+        val normalized = password.lowercase(java.util.Locale.ROOT)
+        val commonBase = normalized.trimEnd { !it.isLetter() }
+        val repeatedPattern = (1..password.length / 2).any { size ->
+            password.length % size == 0 && password.chunked(size).distinct().size == 1
+        }
+        val sequential = listOf("abcdefghijklmnopqrstuvwxyz", "0123456789", "qwertyuiop").any {
+            normalized.length >= 4 && (it.contains(normalized) || it.reversed().contains(normalized))
+        }
+        if (password.length < 8 || password.toSet().size <= 2 || repeatedPattern || sequential ||
+            commonBase in setOf("password", "letmein", "welcome", "admin", "qwerty", "iloveyou")) {
+            return PasswordStrength(0.25f, "Weak", 0xFFEF4444)
         }
 
         var score = 0
@@ -136,7 +143,7 @@ object PasswordGenerator {
             score <= 4 -> PasswordStrength(0.25f, "Weak", 0xFFEF4444)
             score <= 8 -> PasswordStrength(0.55f, "Fair", 0xFFF59E0B)
             score <= 11 -> PasswordStrength(0.80f, "Strong", 0xFF10B981)
-            else -> PasswordStrength(1.0f, "Unbreakable", 0xFF059669)
+            else -> PasswordStrength(1.0f, "Very strong", 0xFF059669)
         }
     }
 }
