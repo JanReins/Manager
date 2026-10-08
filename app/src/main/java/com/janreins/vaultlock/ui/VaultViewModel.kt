@@ -32,6 +32,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.util.UUID
 import javax.crypto.SecretKey
 
 data class VaultUiState(
@@ -82,6 +83,9 @@ class VaultViewModel @JvmOverloads constructor(
     private var lockoutCountdownJob: Job? = null
     private val clipboardClearHandler = Handler(Looper.getMainLooper())
     private var clipboardClearRunnable: Runnable? = null
+    private var ownedClipboard: ClipboardManager? = null
+    private var ownedClipLabel: String? = null
+    private var ownedClipTimestamp: Long? = null
 
     init {
         // Check for existing unlock lockout on initialization
@@ -203,7 +207,7 @@ class VaultViewModel @JvmOverloads constructor(
             ignoreNextBackgroundLock = false
             return
         }
-        lockVault()
+        lockVault(clearClipboard = false)
     }
 
     fun onAppForegrounded() {
@@ -397,7 +401,10 @@ class VaultViewModel @JvmOverloads constructor(
     /**
      * Explicitly locks the vault session and wipes key material from memory.
      */
-    fun lockVault() {
+    fun lockVault(clearClipboard: Boolean = true) {
+        // Backgrounding must not wipe a just-copied secret before the user can paste it elsewhere;
+        // the 30-second timer still clears it in that case.
+        if (clearClipboard) clearOwnedClipboard()
         SessionManager.lock()
         _uiState.update { it.clearedForLock() }
     }
@@ -628,34 +635,32 @@ class VaultViewModel @JvmOverloads constructor(
     fun copyToClipboard(context: Context, text: String, label: String = "VaultLock Data") {
         try {
             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            val clip = ClipData.newPlainText(label, text)
-            // Mark sensitive for Android 13+ clipboard preview masking
+            // A fresh marker identifies this copy without retaining or comparing its plaintext.
+            val marker = "VaultLock:${UUID.randomUUID()}"
+            val clip = ClipData.newPlainText(marker, text)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 clip.description.extras = PersistableBundle().apply {
                     putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
                 }
             }
             clipboard.setPrimaryClip(clip)
-
-            _uiState.update { it.copy(activeCopiedLabel = label) }
-
-            // Auto-clear clipboard after 30 seconds for security
             clipboardClearRunnable?.let { clipboardClearHandler.removeCallbacks(it) }
-            val runnable = Runnable {
-                try {
-                    val currentClip = clipboard.primaryClip
-                    if (currentClip != null && currentClip.itemCount > 0 && currentClip.getItemAt(0).text == text) {
-                        clipboard.setPrimaryClip(ClipData.newPlainText("", ""))
-                    }
-                } catch (_: Exception) {
-                    // Ignore clipboard error
-                }
-                _uiState.update { it.copy(activeCopiedLabel = null) }
+            ownedClipboard = clipboard
+            ownedClipLabel = marker
+            ownedClipTimestamp = try {
+                val description = clipboard.primaryClipDescription
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && description != null && description.label?.toString() == marker) {
+                    description.timestamp
+                } else null
+            } catch (_: Exception) {
+                null // The unique marker still allows ownership checks if timestamps are unavailable.
             }
+            _uiState.update { it.copy(activeCopiedLabel = label) }
+            val runnable = Runnable { clearOwnedClipboard() }
             clipboardClearRunnable = runnable
             clipboardClearHandler.postDelayed(runnable, 30_000)
 
-            // Reset label animation in UI after 2.5 seconds
+            // Reset label animation in UI after 2.5 seconds.
             viewModelScope.launch {
                 delay(2500)
                 if (_uiState.value.activeCopiedLabel == label) {
@@ -663,7 +668,41 @@ class VaultViewModel @JvmOverloads constructor(
                 }
             }
         } catch (_: Exception) {
-            // Fallback
+            // Clipboard access may be denied while the app is in the background.
+        }
+    }
+
+    override fun onCleared() {
+        clearOwnedClipboard()
+        super.onCleared()
+    }
+
+    private fun clearOwnedClipboard() {
+        clipboardClearRunnable?.let { clipboardClearHandler.removeCallbacks(it) }
+        clipboardClearRunnable = null
+        try {
+            val clipboard = ownedClipboard
+            val marker = ownedClipLabel
+            val description = clipboard?.primaryClipDescription
+            val timestamp = ownedClipTimestamp
+            // Android 10+ hides the clipboard from background apps (description == null). Clear anyway
+            // then, because a stale copied secret is worse than dropping a newer clip.
+            val stillOurs = description == null || (description.label?.toString() == marker &&
+                (timestamp == null || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && description.timestamp == timestamp)))
+            if (clipboard != null && marker != null && stillOurs) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    clipboard.clearPrimaryClip()
+                } else {
+                    clipboard.setPrimaryClip(ClipData.newPlainText("", ""))
+                }
+            }
+        } catch (_: Exception) {
+            // Clipboard access may be denied while the app is in the background.
+        } finally {
+            ownedClipboard = null
+            ownedClipLabel = null
+            ownedClipTimestamp = null
+            _uiState.update { it.copy(activeCopiedLabel = null) }
         }
     }
 
