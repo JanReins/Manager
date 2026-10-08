@@ -21,6 +21,10 @@ import com.janreins.vaultlock.data.VaultEntry
 import com.janreins.vaultlock.data.VaultRepository
 import com.janreins.vaultlock.generator.GeneratorOptions
 import com.janreins.vaultlock.generator.PasswordGenerator
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -46,12 +50,15 @@ data class VaultUiState(
     val errorMessage: String? = null,
     val successMessage: String? = null,
     val activeCopiedLabel: String? = null, // For clipboard feedback animation
-    val lockoutRemainingSeconds: Long = 0L
+    val lockoutRemainingSeconds: Long = 0L,
+    val userMessage: String? = null // One-shot, non-sensitive feedback shown as a toast
 )
 
 class VaultViewModel @JvmOverloads constructor(
     application: Application,
-    customSecurityPreferences: SecurityPreferences? = null
+    customSecurityPreferences: SecurityPreferences? = null,
+    /** Dispatcher for CPU-heavy PBKDF2 key derivation; injectable for tests. */
+    private val kdfDispatcher: CoroutineDispatcher = Dispatchers.Default
 ) : AndroidViewModel(application) {
 
     private val securityPreferences = customSecurityPreferences ?: SecurityPreferences(application)
@@ -85,7 +92,7 @@ class VaultViewModel @JvmOverloads constructor(
         // Observe SessionManager unlock state
         viewModelScope.launch {
             SessionManager.isUnlocked.collect { unlocked ->
-                _uiState.update { it.copy(isUnlocked = unlocked) }
+                _uiState.update { if (unlocked) it.copy(isUnlocked = true) else it.clearedForLock() }
                 if (unlocked) {
                     startInactivityTimer()
                 } else {
@@ -98,9 +105,10 @@ class VaultViewModel @JvmOverloads constructor(
         viewModelScope.launch {
             repository.getAllEntries().collect { entries ->
                 _uiState.update { current ->
+                    val visibleEntries = if (SessionManager.hasKey()) entries else emptyList()
                     current.copy(
-                        allEntries = entries,
-                        filteredEntries = filterEntries(entries, current.searchQuery, current.selectedCategory)
+                        allEntries = visibleEntries,
+                        filteredEntries = filterEntries(visibleEntries, current.searchQuery, current.selectedCategory)
                     )
                 }
             }
@@ -226,7 +234,7 @@ class VaultViewModel @JvmOverloads constructor(
         }
         viewModelScope.launch {
             try {
-                val derivedKey = securityPreferences.setupMasterPassword(password.toCharArray())
+                val derivedKey = withContext(kdfDispatcher) { securityPreferences.setupMasterPassword(password.toCharArray()) }
                 SessionManager.setKey(derivedKey)
                 _uiState.update {
                     it.copy(
@@ -255,6 +263,8 @@ class VaultViewModel @JvmOverloads constructor(
                     _uiState.update { it.copy(isBiometricEnabled = false) }
                     onComplete(true, "Master Password created successfully")
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 onComplete(false, "Setup failed: ${e.localizedMessage}")
             }
@@ -278,7 +288,7 @@ class VaultViewModel @JvmOverloads constructor(
 
         viewModelScope.launch {
             try {
-                val key = securityPreferences.verifyAndDeriveKey(password.toCharArray())
+                val key = withContext(kdfDispatcher) { securityPreferences.verifyAndDeriveKey(password.toCharArray()) }
                 if (key != null) {
                     securityPreferences.resetFailedUnlockAttempts()
                     SessionManager.setKey(key)
@@ -291,6 +301,8 @@ class VaultViewModel @JvmOverloads constructor(
                     startLockoutCountdown()
                     onResult(false, msg)
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 onResult(false, "Authentication error: ${e.localizedMessage}")
             }
@@ -342,7 +354,20 @@ class VaultViewModel @JvmOverloads constructor(
      */
     fun lockVault() {
         SessionManager.lock()
-        _uiState.update { it.copy(isUnlocked = false) }
+        _uiState.update { it.clearedForLock() }
+    }
+
+    private fun VaultUiState.clearedForLock() = copy(
+        isUnlocked = false,
+        allEntries = emptyList(),
+        filteredEntries = emptyList(),
+        searchQuery = "",
+        currentGeneratedPassword = "",
+        activeCopiedLabel = null
+    )
+
+    fun consumeUserMessage() {
+        _uiState.update { it.copy(userMessage = null) }
     }
 
     fun setSearchQuery(query: String) {
@@ -365,21 +390,39 @@ class VaultViewModel @JvmOverloads constructor(
 
     fun saveEntry(entry: VaultEntry, onComplete: () -> Unit = {}) {
         viewModelScope.launch {
-            repository.saveEntry(entry)
-            onComplete()
+            try {
+                repository.saveEntry(entry)
+                onComplete()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _uiState.update { it.copy(userMessage = "Save failed: ${e.localizedMessage}") }
+            }
         }
     }
 
     fun toggleFavorite(entry: VaultEntry) {
         viewModelScope.launch {
-            repository.toggleFavorite(entry.id, !entry.isFavorite)
+            try {
+                repository.toggleFavorite(entry.id, !entry.isFavorite)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _uiState.update { it.copy(userMessage = "Favorite update failed: ${e.localizedMessage}") }
+            }
         }
     }
 
     fun deleteEntry(id: Long, onComplete: () -> Unit = {}) {
         viewModelScope.launch {
-            repository.deleteEntry(id)
-            onComplete()
+            try {
+                repository.deleteEntry(id)
+                onComplete()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _uiState.update { it.copy(userMessage = "Delete failed: ${e.localizedMessage}") }
+            }
         }
     }
 
@@ -411,7 +454,7 @@ class VaultViewModel @JvmOverloads constructor(
                     return@launch
                 }
 
-                val oldKey = securityPreferences.verifyAndDeriveKey(currentPass.toCharArray())
+                val oldKey = withContext(kdfDispatcher) { securityPreferences.verifyAndDeriveKey(currentPass.toCharArray()) }
                 if (oldKey == null) {
                     val delaySeconds = securityPreferences.recordFailedUnlockAttempt()
                     val msg = "Current password is incorrect. Try again in $delaySeconds second(s)."
@@ -422,18 +465,26 @@ class VaultViewModel @JvmOverloads constructor(
                 }
                 securityPreferences.resetFailedUnlockAttempts()
 
-                val prepared = securityPreferences.prepareMasterPasswordChange(newPass.toCharArray())
+                val prepared = withContext(kdfDispatcher) { securityPreferences.prepareMasterPasswordChange(newPass.toCharArray()) }
                 repository.reEncryptAll(oldKey, prepared.secretKey)
-                securityPreferences.commitMasterPasswordChange(prepared)
+                if (!securityPreferences.commitMasterPasswordChange(prepared)) {
+                    throw IllegalStateException("Failed to persist new Master Password")
+                }
                 SessionManager.setKey(prepared.secretKey)
 
-                // Re-enroll biometric if it was active
-                if (securityPreferences.isBiometricEnabled && activity != null) {
+                // Purge the old wrapped key before attempting enrollment with the new key.
+                val wasBiometricEnabled = securityPreferences.isBiometricEnabled
+                if (wasBiometricEnabled) {
+                    securityPreferences.disableBiometric()
+                    _uiState.update { it.copy(isBiometricEnabled = false) }
+                }
+                if (wasBiometricEnabled && activity != null) {
                     BiometricHelper.promptBiometricEnrollment(
                         activity = activity,
                         masterKeyToWrap = prepared.secretKey,
                         onEnrolled = { wrappedKey ->
                             securityPreferences.saveBiometricWrappedKey(wrappedKey)
+                            _uiState.update { it.copy(isBiometricEnabled = true) }
                             onResult(true, "Master Password changed & biometric updated")
                         },
                         onError = {
@@ -443,8 +494,12 @@ class VaultViewModel @JvmOverloads constructor(
                         }
                     )
                 } else {
-                    onResult(true, "Master Password changed & vault re-encrypted")
+                    onResult(true, if (wasBiometricEnabled) {
+                        "Master Password changed (re-enable biometric unlock in Settings)"
+                    } else "Master Password changed & vault re-encrypted")
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 onResult(false, "Failed to change password: ${e.message}")
             }
@@ -549,11 +604,15 @@ class VaultViewModel @JvmOverloads constructor(
     }
 
     fun exportBackup(onReady: (ByteArray?) -> Unit) {
+        _uiState.update { it.copy(errorMessage = null) }
         viewModelScope.launch {
             try {
                 val payload = repository.createEncryptedBackupPayload()
                 onReady(payload)
-            } catch (_: Exception) {
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _uiState.update { it.copy(errorMessage = "Backup failed: ${e.localizedMessage}") }
                 onReady(null)
             }
         }
@@ -564,6 +623,8 @@ class VaultViewModel @JvmOverloads constructor(
             try {
                 val restoredCount = repository.restoreEncryptedBackupPayload(encryptedBytes)
                 onComplete(true, restoredCount, "Successfully restored $restoredCount entries")
+            } catch (e: CancellationException) {
+                throw e
             } catch (_: Exception) {
                 onComplete(false, 0, "Failed to restore backup: Invalid password or corrupted file")
             }
@@ -572,17 +633,23 @@ class VaultViewModel @JvmOverloads constructor(
 
     fun wipeAllData(onComplete: () -> Unit) {
         viewModelScope.launch {
-            repository.wipeEverything()
-            BiometricHelper.deleteKeystoreKey()
-            _uiState.update {
-                VaultUiState(
-                    isMasterPasswordSet = false,
-                    isUnlocked = false,
-                    isBiometricAvailable = BiometricHelper.isBiometricAvailable(getApplication()),
-                    isBiometricEnabled = false
-                )
+            try {
+                repository.wipeEverything()
+                BiometricHelper.deleteKeystoreKey()
+                _uiState.update {
+                    VaultUiState(
+                        isMasterPasswordSet = false,
+                        isUnlocked = false,
+                        isBiometricAvailable = BiometricHelper.isBiometricAvailable(getApplication()),
+                        isBiometricEnabled = false
+                    )
+                }
+                onComplete()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _uiState.update { it.copy(userMessage = "Wipe failed: ${e.localizedMessage}") }
             }
-            onComplete()
         }
     }
 }

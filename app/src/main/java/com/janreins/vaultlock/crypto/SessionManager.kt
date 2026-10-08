@@ -11,23 +11,24 @@ import javax.crypto.SecretKey
  * Note: Due to JVM heap behavior, immutable SecretKeySpec internal arrays may persist until collected by GC.
  */
 object SessionManager {
-    private var activeSecretKey: SecretKey? = null
+    private val _activeKey = MutableStateFlow<SecretKey?>(null)
+    val activeKey: StateFlow<SecretKey?> = _activeKey.asStateFlow()
     private var lastActiveTimestamp: Long = System.currentTimeMillis()
 
     private val _isUnlocked = MutableStateFlow(false)
     val isUnlocked: StateFlow<Boolean> = _isUnlocked.asStateFlow()
 
     fun setKey(key: SecretKey) {
-        activeSecretKey = key
+        _activeKey.value = key
         lastActiveTimestamp = System.currentTimeMillis()
         _isUnlocked.value = true
     }
 
     fun getKey(): SecretKey {
-        return activeSecretKey ?: throw IllegalStateException("Vault is locked")
+        return _activeKey.value ?: throw IllegalStateException("Vault is locked")
     }
 
-    fun hasKey(): Boolean = activeSecretKey != null
+    fun hasKey(): Boolean = _activeKey.value != null
 
     fun recordActivity() {
         lastActiveTimestamp = System.currentTimeMillis()
@@ -36,7 +37,8 @@ object SessionManager {
     fun getLastActivity(): Long = lastActiveTimestamp
 
     fun lock() {
-        val key = activeSecretKey
+        val key = _activeKey.value
+        _activeKey.value = null
         if (key != null) {
             try {
                 if (!key.isDestroyed) {
@@ -46,7 +48,6 @@ object SessionManager {
                 // Best effort destroy if supported by provider/implementation
             }
         }
-        activeSecretKey = null
         _isUnlocked.value = false
     }
 }

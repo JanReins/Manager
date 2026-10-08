@@ -360,7 +360,7 @@ fun SettingsScreen(
                                     val message = if (backupBytes != null) {
                                         backupBytes.fill(0)
                                         "Backup exceeds the supported 16 MiB size."
-                                    } else "Backup failed. Unlock the vault and try again."
+                                    } else viewModel.uiState.value.errorMessage ?: "Backup failed. Unlock the vault and try again."
                                     coroutineScope.launch { snackbarHostState.showSnackbar(message) }
                                 }
                               }

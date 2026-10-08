@@ -4,11 +4,15 @@ import com.janreins.vaultlock.crypto.CryptoManager
 import com.janreins.vaultlock.crypto.SessionManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import javax.crypto.SecretKey
+
+class VaultDecryptionException(entryId: Long, cause: Exception) :
+    IllegalStateException("Cannot decrypt vault entry $entryId. Original data has been preserved.", cause)
 
 class VaultRepository(
     private val vaultDao: VaultDao,
@@ -18,12 +22,13 @@ class VaultRepository(
      * Decrypts database entities into domain models in real-time when the vault session is unlocked.
      */
     fun getAllEntries(): Flow<List<VaultEntry>> {
-        return vaultDao.getAllEntriesFlow().map { entities ->
-            val key = if (SessionManager.hasKey()) SessionManager.getKey() else null
-            entities.map { entity ->
-                entity.toDomain(key)
+        return combine(vaultDao.getAllEntriesFlow(), SessionManager.activeKey) { entities, key ->
+            if (key == null) emptyList() else {
+                val entries = entities.map { it.toDomain(key) }
+                // Discard work from a session that expired during decryption.
+                if (SessionManager.activeKey.value === key) entries else emptyList()
             }
-        }
+        }.flowOn(Dispatchers.Default)
     }
 
     suspend fun getEntryById(id: Long): VaultEntry? = withContext(Dispatchers.IO) {
@@ -34,6 +39,11 @@ class VaultRepository(
 
     suspend fun saveEntry(entry: VaultEntry) = withContext(Dispatchers.IO) {
         val key = SessionManager.getKey()
+        if (entry.id != 0L) {
+            val existing = vaultDao.getEntryById(entry.id)
+                ?: throw IllegalStateException("Entry no longer exists")
+            existing.toDomainStrict(key)
+        }
         val entity = entry.toEntity(key)
         if (entry.id == 0L) {
             vaultDao.insertEntry(entity)
@@ -54,7 +64,7 @@ class VaultRepository(
     suspend fun reEncryptAll(oldKey: SecretKey, newKey: SecretKey) = withContext(Dispatchers.IO) {
         val entities = vaultDao.getAllEntriesSync()
         val updated = entities.map { entity ->
-            val domain = entity.toDomain(oldKey)
+            val domain = entity.toDomainStrict(oldKey)
             domain.toEntity(newKey)
         }
         vaultDao.insertAll(updated)
@@ -66,7 +76,7 @@ class VaultRepository(
         val itemsArray = JSONArray()
 
         for (entity in entities) {
-            val domain = entity.toDomain(key)
+            val domain = entity.toDomainStrict(key)
             val jsonItem = JSONObject().apply {
                 put("id", domain.id)
                 put("title", domain.title)
@@ -149,19 +159,7 @@ class VaultRepository(
         }
 
         return try {
-            VaultEntry(
-                id = id,
-                title = CryptoManager.decrypt(encryptedTitle, key),
-                username = CryptoManager.decrypt(encryptedUsername, key),
-                password = CryptoManager.decrypt(encryptedPassword, key),
-                url = CryptoManager.decrypt(encryptedUrl, key),
-                notes = CryptoManager.decrypt(encryptedNotes, key),
-                totpSecret = CryptoManager.decrypt(encryptedTotpSecret, key),
-                category = category,
-                isFavorite = isFavorite,
-                createdAt = createdAt,
-                updatedAt = updatedAt
-            )
+            toDomainStrict(key)
         } catch (_: Exception) {
             VaultEntry(
                 id = id,
@@ -176,6 +174,26 @@ class VaultRepository(
                 createdAt = createdAt,
                 updatedAt = updatedAt
             )
+        }
+    }
+
+    private fun VaultEntryEntity.toDomainStrict(key: SecretKey): VaultEntry {
+        return try {
+            VaultEntry(
+                id = id,
+                title = CryptoManager.decrypt(encryptedTitle, key),
+                username = CryptoManager.decrypt(encryptedUsername, key),
+                password = CryptoManager.decrypt(encryptedPassword, key),
+                url = CryptoManager.decrypt(encryptedUrl, key),
+                notes = CryptoManager.decrypt(encryptedNotes, key),
+                totpSecret = CryptoManager.decrypt(encryptedTotpSecret, key),
+                category = category,
+                isFavorite = isFavorite,
+                createdAt = createdAt,
+                updatedAt = updatedAt
+            )
+        } catch (e: Exception) {
+            throw VaultDecryptionException(id, e)
         }
     }
 

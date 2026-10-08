@@ -121,7 +121,9 @@ class SecurityPreferences(context: Context, customPrefs: SharedPreferences? = nu
      */
     fun setupMasterPassword(password: CharArray): SecretKey {
         val prepared = prepareMasterPasswordChange(password)
-        commitMasterPasswordChange(prepared)
+        if (!commitMasterPasswordChange(prepared)) {
+            throw IllegalStateException("Failed to persist Master Password")
+        }
         return prepared.secretKey
     }
 

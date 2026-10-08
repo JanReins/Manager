@@ -4,7 +4,7 @@ Reviewed commit: `bdedd3b` (the repository's default branch when cloned).
 
 **Status: improvements prepared; not ready for production credential storage.**
 The release blockers below need repairs in components protected by `AGENTS.md`.
-No protected implementation was changed in this revision. Proposed changes and current CI results
+The focused data-safety follow-up below modifies protected components with explicit authorization. Proposed changes and current CI results
 are available in [PR #6](https://github.com/JanReins/Manager/pull/6).
 
 ## Implemented improvements
@@ -86,3 +86,16 @@ The offline policy remains mandatory: no INTERNET permission, network client, sy
 - [Android's AGP 9 migration guidance](https://github.com/android/skills/blob/main/build-system/agp/agp-9-upgrade/SKILL.md)
 - [KSP 2.3.6 release](https://github.com/google/ksp/releases/tag/2.3.6)
 - [Android app signing](https://developer.android.com/studio/publish/app-signing)
+
+## Data-safety fixes — follow-up
+
+Fixed session-reactive entry loading and clearing of sensitive ViewModel state on lock; strict
+decryption for rotation, export, and existing-entry updates; guarded mutation/export errors (shown as a toast instead of crashing);
+worker-dispatcher password derivation; setup/rotation commit-result checks; and invalidation of
+stale biometric wrapping during rotation, including when no Activity is available. Rotation
+prepares all rows before one Room batch insert. Added isolated Robolectric repository regressions
+for session transitions, failed rotation/export/update, and successful updates.
+
+Verified with `testDebugUnitTest lintDebug assembleDebug`. Database schema/version, encryption format, permissions,
+and dependencies are unchanged. Cross-store crash-safe rotation and portable backup recovery
+remain open release blockers; checking the preference commit does not solve either problem.
