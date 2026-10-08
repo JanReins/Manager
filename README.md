@@ -28,7 +28,7 @@ VaultLock uses local encryption to protect credentials stored on-device:
 
 ---
 
-## 🛠️ Building & Testing
+## 🛠️ Building & releases
 
 ### Prerequisites
 - JDK 17 or higher
@@ -45,7 +45,8 @@ VaultLock uses local encryption to protect credentials stored on-device:
 ```
 Android's default debug keystore is generated automatically; no repository keystore is needed.
 The Android CI workflow runs these checks, verifies that the APK has no network permissions,
-and uploads the debug APK and reports. Debug APKs are for testing and use a different signing
+and uploads the debug APK as `app-debug-apk` plus reports. Pushing a `v*` tag creates a GitHub
+Release with the debug APK. Debug APKs are for testing and use a different signing
 key from a production installation; do not uninstall an existing vault to install one.
 
 ### Current recovery limitations
@@ -63,8 +64,9 @@ blockers there are fixed and Android/device checks pass.
 ```bash
 ./gradlew assembleRelease
 ```
-Release signing requires `KEYSTORE_PATH`, `STORE_PASSWORD`, and `KEY_PASSWORD` for your existing
-upload keystore (alias `upload`). Keep the same production signing key for updates; never commit it.
+Release signing is optional: set `KEYSTORE_PATH` to an existing keystore file and provide non-blank
+`STORE_PASSWORD` and `KEY_PASSWORD`. `KEY_ALIAS` is optional and defaults to `upload`.
+Without these, the release APK is unsigned. Keep the same production signing key for updates; never commit it.
 
 ---
 
