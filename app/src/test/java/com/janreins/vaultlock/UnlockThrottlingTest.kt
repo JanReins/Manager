@@ -92,7 +92,7 @@ class UnlockThrottlingTest {
         securityPreferences.setupMasterPassword(masterPass.toCharArray())
         SessionManager.lock()
 
-        val viewModel = VaultViewModel(application, securityPreferences)
+        val viewModel = VaultViewModel(application, securityPreferences, testDispatcher)
 
         // 1. Attempt unlock with incorrect password
         var unlockSuccess = false
