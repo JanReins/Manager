@@ -61,6 +61,17 @@ class VaultRepository(
         vaultDao.deleteEntryById(id)
     }
 
+    /** A batch rotation leaves every row under the same key; one strict read identifies it. */
+    suspend fun keyDecryptsVault(key: SecretKey): Boolean? = withContext(Dispatchers.IO) {
+        val first = vaultDao.getAllEntriesSync().firstOrNull() ?: return@withContext null
+        try {
+            first.toDomainStrict(key)
+            true
+        } catch (_: VaultDecryptionException) {
+            false
+        }
+    }
+
     suspend fun reEncryptAll(oldKey: SecretKey, newKey: SecretKey) = withContext(Dispatchers.IO) {
         val entities = vaultDao.getAllEntriesSync()
         val updated = entities.map { entity ->

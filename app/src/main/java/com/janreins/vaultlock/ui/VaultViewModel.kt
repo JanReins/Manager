@@ -288,7 +288,39 @@ class VaultViewModel @JvmOverloads constructor(
 
         viewModelScope.launch {
             try {
-                val key = withContext(kdfDispatcher) { securityPreferences.verifyAndDeriveKey(password.toCharArray()) }
+                var key = withContext(kdfDispatcher) { securityPreferences.verifyAndDeriveKey(password.toCharArray()) }
+                if (securityPreferences.hasPendingMasterPasswordChange()) {
+                    // Recover an interrupted master password change. Rows are re-encrypted in a single
+                    // transaction, so the key that decrypts the vault tells which credentials are live.
+                    val currentKey = key
+                    if (currentKey != null && repository.keyDecryptsVault(currentKey) != false) {
+                        if (!securityPreferences.clearPendingMasterPasswordChange()) {
+                            throw IllegalStateException("Failed to clear pending master password change. Please retry.")
+                        }
+                    } else {
+                        // Also covers a change to the same password text (new salt, new key).
+                        val pendingKey = withContext(kdfDispatcher) { securityPreferences.verifyPendingAndDeriveKey(password.toCharArray()) }
+                        if (pendingKey != null && repository.keyDecryptsVault(pendingKey) != false) {
+                            if (!securityPreferences.promotePendingMasterPasswordChange()) {
+                                throw IllegalStateException("Failed to finish pending master password change. Please retry with your NEW master password.")
+                            }
+                            key = pendingKey
+                        } else if (pendingKey != null) {
+                            if (!securityPreferences.clearPendingMasterPasswordChange()) {
+                                throw IllegalStateException("Failed to clear pending master password change. Please retry.")
+                            }
+                            val msg = "The master password change did not complete. Unlock with your PREVIOUS master password."
+                            _uiState.update { it.copy(errorMessage = msg) }
+                            onResult(false, msg)
+                            return@launch
+                        } else if (currentKey != null) {
+                            val msg = "A master password change was interrupted. Unlock with your NEW master password to finish it."
+                            _uiState.update { it.copy(errorMessage = msg) }
+                            onResult(false, msg)
+                            return@launch
+                        }
+                    }
+                }
                 if (key != null) {
                     securityPreferences.resetFailedUnlockAttempts()
                     SessionManager.setKey(key)
@@ -314,6 +346,10 @@ class VaultViewModel @JvmOverloads constructor(
      * The master key is unwrapped atomically inside the CryptoObject callback.
      */
     fun unlockWithBiometric(activity: FragmentActivity, onResult: (Boolean, String) -> Unit) {
+        if (securityPreferences.hasPendingMasterPasswordChange()) {
+            onResult(false, "A master password change was interrupted. Unlock with your master password to recover it.")
+            return
+        }
         if (!_uiState.value.isBiometricEnabled) {
             onResult(false, "Biometric unlock not enabled")
             return
@@ -336,10 +372,19 @@ class VaultViewModel @JvmOverloads constructor(
                 _uiState.update { it.copy(isBiometricEnabled = false) }
             },
             onSuccess = { secretKey ->
-                securityPreferences.resetFailedUnlockAttempts()
-                SessionManager.setKey(secretKey)
-                _uiState.update { it.copy(isUnlocked = true, errorMessage = null, lockoutRemainingSeconds = 0) }
-                onResult(true, "Unlocked via Biometrics")
+                if (securityPreferences.hasPendingMasterPasswordChange()) {
+                    onResult(false, "A master password change was interrupted. Unlock with your master password to recover it.")
+                } else if (!securityPreferences.verifyKey(secretKey)) {
+                    securityPreferences.disableBiometric()
+                    val msg = "Biometric key is out of date. Unlock with your master password and re-enable biometric unlock."
+                    _uiState.update { it.copy(isBiometricEnabled = false, errorMessage = msg) }
+                    onResult(false, msg)
+                } else {
+                    securityPreferences.resetFailedUnlockAttempts()
+                    SessionManager.setKey(secretKey)
+                    _uiState.update { it.copy(isUnlocked = true, errorMessage = null, lockoutRemainingSeconds = 0) }
+                    onResult(true, "Unlocked via Biometrics")
+                }
             },
             onError = { error ->
                 if (error != "cancelled") {
@@ -466,17 +511,36 @@ class VaultViewModel @JvmOverloads constructor(
                 securityPreferences.resetFailedUnlockAttempts()
 
                 val prepared = withContext(kdfDispatcher) { securityPreferences.prepareMasterPasswordChange(newPass.toCharArray()) }
-                repository.reEncryptAll(oldKey, prepared.secretKey)
-                if (!securityPreferences.commitMasterPasswordChange(prepared)) {
-                    throw IllegalStateException("Failed to persist new Master Password")
+                // Check after derivation too: another rotation may have staged while it ran.
+                if (securityPreferences.hasPendingMasterPasswordChange()) {
+                    onResult(false, "Unlock with your master password to finish the interrupted change before changing it again.")
+                    return@launch
                 }
+                if (!securityPreferences.stagePendingMasterPasswordChange(prepared)) {
+                    throw IllegalStateException("Failed to stage new Master Password; vault was not changed")
+                }
+                try {
+                    repository.reEncryptAll(oldKey, prepared.secretKey)
+                } catch (e: CancellationException) {
+                    // IO may have committed before cancellation was delivered. Keep recovery metadata.
+                    throw e
+                } catch (e: Exception) {
+                    securityPreferences.clearPendingMasterPasswordChange()
+                    throw e
+                }
+                // The database now needs this key even if the preference commit fails.
                 SessionManager.setKey(prepared.secretKey)
+                val committed = securityPreferences.commitMasterPasswordChange(prepared)
 
                 // Purge the old wrapped key before attempting enrollment with the new key.
                 val wasBiometricEnabled = securityPreferences.isBiometricEnabled
                 if (wasBiometricEnabled) {
                     securityPreferences.disableBiometric()
                     _uiState.update { it.copy(isBiometricEnabled = false) }
+                }
+                if (!committed) {
+                    onResult(false, "Vault re-encrypted, but failed to persist new Master Password. Your NEW master password is required to finish recovery on the next unlock.")
+                    return@launch
                 }
                 if (wasBiometricEnabled && activity != null) {
                     BiometricHelper.promptBiometricEnrollment(

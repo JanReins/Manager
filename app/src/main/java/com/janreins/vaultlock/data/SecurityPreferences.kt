@@ -63,6 +63,8 @@ class SecurityPreferences(context: Context, customPrefs: SharedPreferences? = nu
         private const val KEY_IS_SETUP = "key_is_setup"
         private const val KEY_SALT = "key_master_salt"
         private const val KEY_VERIFIER = "key_auth_verifier"
+        private const val KEY_PENDING_SALT = "key_pending_master_salt"
+        private const val KEY_PENDING_VERIFIER = "key_pending_auth_verifier"
         private const val KEY_BIOMETRIC_ENABLED = "key_biometric_enabled"
         private const val KEY_WRAPPED_KEY = "key_wrapped_master_key"
         private const val KEY_AUTO_LOCK_SECONDS = "key_auto_lock_seconds"
@@ -110,6 +112,8 @@ class SecurityPreferences(context: Context, customPrefs: SharedPreferences? = nu
             .putBoolean(KEY_IS_SETUP, true)
             .putString(KEY_SALT, prepared.saltBase64)
             .putString(KEY_VERIFIER, prepared.verifierEncrypted)
+            .remove(KEY_PENDING_SALT)
+            .remove(KEY_PENDING_VERIFIER)
             .putLong(KEY_AUTO_LOCK_SECONDS, prefs.getLong(KEY_AUTO_LOCK_SECONDS, 120L))
             .commit()
     }
@@ -132,8 +136,53 @@ class SecurityPreferences(context: Context, customPrefs: SharedPreferences? = nu
      * Returns the derived SecretKey if valid, or null if incorrect.
      */
     fun verifyAndDeriveKey(password: CharArray): SecretKey? {
-        val saltBase64 = prefs.getString(KEY_SALT, null) ?: return null
-        val verifierEncrypted = prefs.getString(KEY_VERIFIER, null) ?: return null
+        return verifyAndDeriveKey(password, KEY_SALT, KEY_VERIFIER)
+    }
+
+    fun verifyPendingAndDeriveKey(password: CharArray): SecretKey? {
+        return verifyAndDeriveKey(password, KEY_PENDING_SALT, KEY_PENDING_VERIFIER)
+    }
+
+    fun stagePendingMasterPasswordChange(prepared: PreparedMasterPassword): Boolean {
+        return prefs.edit()
+            .putString(KEY_PENDING_SALT, prepared.saltBase64)
+            .putString(KEY_PENDING_VERIFIER, prepared.verifierEncrypted)
+            .commit()
+    }
+
+    fun hasPendingMasterPasswordChange(): Boolean {
+        return prefs.contains(KEY_PENDING_SALT) || prefs.contains(KEY_PENDING_VERIFIER)
+    }
+
+    fun clearPendingMasterPasswordChange(): Boolean {
+        return prefs.edit().remove(KEY_PENDING_SALT).remove(KEY_PENDING_VERIFIER).commit()
+    }
+
+    fun promotePendingMasterPasswordChange(): Boolean {
+        val salt = prefs.getString(KEY_PENDING_SALT, null) ?: return false
+        val verifier = prefs.getString(KEY_PENDING_VERIFIER, null) ?: return false
+        return prefs.edit()
+            .putBoolean(KEY_IS_SETUP, true)
+            .putString(KEY_SALT, salt)
+            .putString(KEY_VERIFIER, verifier)
+            .remove(KEY_PENDING_SALT)
+            .remove(KEY_PENDING_VERIFIER)
+            .commit()
+    }
+
+    /** Checks the current verifier without deriving another key. */
+    fun verifyKey(key: SecretKey): Boolean {
+        val verifier = prefs.getString(KEY_VERIFIER, null) ?: return false
+        return try {
+            CryptoManager.decrypt(verifier, key) == VERIFIER_MAGIC
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun verifyAndDeriveKey(password: CharArray, saltKey: String, verifierKey: String): SecretKey? {
+        val saltBase64 = prefs.getString(saltKey, null) ?: return null
+        val verifierEncrypted = prefs.getString(verifierKey, null) ?: return null
 
         val salt = Base64.decode(saltBase64, Base64.NO_WRAP)
         val derivedKey = CryptoManager.deriveKey(password, salt)
