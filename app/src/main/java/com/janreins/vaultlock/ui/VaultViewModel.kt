@@ -91,13 +91,15 @@ class VaultViewModel @JvmOverloads constructor(
     val uiState: StateFlow<VaultUiState> = _uiState.asStateFlow()
 
     companion object {
-        const val PICKER_SUPPRESS_WINDOW_MS = 5_000L
         const val CONFIG_CHANGE_GRACE_MS = 5_000L
+        const val PENDING_IMPORT_TTL_MS = 600_000L
     }
 
     private val entryDrafts = mutableMapOf<String, EntryDraft>()
     private var pendingExport: ByteArray? = null
     private var pendingImport: ByteArray? = null
+    private var pendingImportSetAt: Long? = null
+    private var pendingImportExpiryJob: Job? = null
     private var backupGeneration = 0L
     private var configChangeGuardJob: Job? = null
     private var autoLockJob: Job? = null
@@ -117,6 +119,10 @@ class VaultViewModel @JvmOverloads constructor(
         // Observe SessionManager unlock state
         viewModelScope.launch {
             SessionManager.isUnlocked.collect { unlocked ->
+                if (!unlocked) {
+                    clearEntryDrafts()
+                    discardUnlaunchedExport()
+                }
                 _uiState.update { if (unlocked) it.copy(isUnlocked = true) else it.clearedForLock() }
                 if (unlocked) {
                     startInactivityTimer()
@@ -213,17 +219,6 @@ class VaultViewModel @JvmOverloads constructor(
         }
     }
 
-    private var pickerSuppressedAt: Long? = null
-
-    fun suppressNextBackgroundLock() {
-        if (_uiState.value.autoLockSeconds == 0L) return
-        pickerSuppressedAt = elapsedRealtime()
-    }
-
-    fun cancelSuppressedBackgroundLock() {
-        pickerSuppressedAt = null
-    }
-
     fun onActivityStopped(isChangingConfigurations: Boolean) {
         configChangeGuardJob?.cancel()
         if (isChangingConfigurations) {
@@ -236,21 +231,14 @@ class VaultViewModel @JvmOverloads constructor(
         }
     }
 
-    /** A picker can consume one stop, within a short window and with an idle timeout. */
     fun onAppBackgrounded() {
         configChangeGuardJob?.cancel()
-        val armedAt = pickerSuppressedAt
-        cancelSuppressedBackgroundLock()
-        val elapsed = armedAt?.let { elapsedRealtime() - it }
-        if (_uiState.value.autoLockSeconds != 0L && elapsed != null &&
-            elapsed in 0..PICKER_SUPPRESS_WINDOW_MS) return
         lockVault(clearClipboard = false)
     }
 
     fun onAppForegrounded() {
         configChangeGuardJob?.cancel()
         configChangeGuardJob = null
-        cancelSuppressedBackgroundLock()
         if (_uiState.value.isUnlocked) {
             val timeoutMillis = _uiState.value.autoLockSeconds * 1000L
             if (timeoutMillis > 0) {
@@ -460,8 +448,9 @@ class VaultViewModel @JvmOverloads constructor(
         // the 30-second timer still clears it in that case.
         if (clearClipboard) clearOwnedClipboard()
         configChangeGuardJob?.cancel()
-        cancelSuppressedBackgroundLock()
         SessionManager.lock()
+        clearEntryDrafts()
+        discardUnlaunchedExport()
         _uiState.update { it.clearedForLock() }
     }
 
@@ -477,7 +466,6 @@ class VaultViewModel @JvmOverloads constructor(
     }
 
     private fun VaultUiState.clearedForLock(): VaultUiState {
-        clearEntryDrafts()
         return copy(
             isUnlocked = false,
             allEntries = emptyList(),
@@ -793,6 +781,7 @@ class VaultViewModel @JvmOverloads constructor(
     }
 
     fun exportBackup(password: CharArray) {
+        val sessionGeneration = SessionManager.generation()
         if (_uiState.value.isBackupBusy || !SessionManager.hasKey()) {
             password.fill('\u0000')
             return
@@ -804,6 +793,16 @@ class VaultViewModel @JvmOverloads constructor(
                 val payload = repository.createEncryptedBackupPayload(password)
                 if (generation != backupGeneration) {
                     payload.fill(0)
+                    return@launch
+                }
+                if (sessionGeneration != SessionManager.generation() || !SessionManager.hasKey()) {
+                    payload.fill(0)
+                    _uiState.update {
+                        it.copy(
+                            isBackupBusy = false,
+                            userMessage = "Vault locked before the backup was ready. Unlock and export again."
+                        )
+                    }
                     return@launch
                 }
                 if (payload.size > BackupFileIO.MAX_BACKUP_BYTES) {
@@ -833,6 +832,14 @@ class VaultViewModel @JvmOverloads constructor(
         _uiState.update { it.copy(exportReadyFileName = null) }
     }
 
+    private fun discardUnlaunchedExport() {
+        // A consumed filename means the picker is already open and may still save ciphertext.
+        if (_uiState.value.exportReadyFileName == null || pendingExport == null) return
+        pendingExport?.fill(0)
+        pendingExport = null
+        _uiState.update { it.copy(exportReadyFileName = null, isBackupBusy = false) }
+    }
+
     fun beginImportPicker(): Boolean {
         if (_uiState.value.isBackupBusy) return false
         _uiState.update { it.copy(isBackupBusy = true) }
@@ -840,7 +847,6 @@ class VaultViewModel @JvmOverloads constructor(
     }
 
     fun onBackupPickerLaunchFailed(export: Boolean) {
-        cancelSuppressedBackgroundLock()
         if (export) {
             pendingExport?.fill(0)
             pendingExport = null
@@ -855,7 +861,6 @@ class VaultViewModel @JvmOverloads constructor(
     }
 
     fun completeExport(uri: Uri?) {
-        cancelSuppressedBackgroundLock()
         consumeExportReadyFileName()
         val bytes = pendingExport
         pendingExport = null
@@ -870,8 +875,11 @@ class VaultViewModel @JvmOverloads constructor(
             try {
                 val message = withContext(Dispatchers.IO) {
                     if (bytes == null) {
-                        deleteBackupDocument(uri)
-                        "Backup was not saved: the encrypted data was lost. Unlock and export again."
+                        if (deleteBackupDocument(uri)) {
+                            "Backup was not saved: the encrypted data was lost. Unlock and export again."
+                        } else {
+                            "Backup was not saved: the encrypted data was lost. An empty file was left in the chosen folder; delete it, then unlock and export again."
+                        }
                     } else {
                         try {
                             backupDocumentStore.write(uri, bytes)
@@ -879,8 +887,11 @@ class VaultViewModel @JvmOverloads constructor(
                         } catch (e: CancellationException) {
                             throw e
                         } catch (_: Exception) {
-                            deleteBackupDocument(uri)
-                            "Backup could not be saved. Try another destination."
+                            if (deleteBackupDocument(uri)) {
+                                "Backup could not be saved. Try another destination."
+                            } else {
+                                "Backup could not be saved. An empty file may have been left in the chosen folder. Try another destination."
+                            }
                         }
                     }
                 }
@@ -892,12 +903,10 @@ class VaultViewModel @JvmOverloads constructor(
         }
     }
 
-    private fun deleteBackupDocument(uri: Uri) {
-        try { backupDocumentStore.delete(uri) } catch (_: Exception) { /* Best effort. */ }
-    }
+    private fun deleteBackupDocument(uri: Uri): Boolean =
+        try { backupDocumentStore.delete(uri) } catch (_: Exception) { false }
 
     fun onImportFilePicked(uri: Uri?) {
-        cancelSuppressedBackgroundLock()
         if (uri == null) {
             discardPendingImport()
             return
@@ -912,8 +921,14 @@ class VaultViewModel @JvmOverloads constructor(
                     backupDocumentStore.read(uri).also { readBytes = it }
                 }
                 if (generation != backupGeneration) return@launch
+                cancelPendingImportExpiry()
                 pendingImport?.fill(0)
                 pendingImport = bytes
+                pendingImportSetAt = elapsedRealtime()
+                pendingImportExpiryJob = viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                    delay(PENDING_IMPORT_TTL_MS)
+                    expirePendingImport()
+                }
                 readBytes = null // Ownership transferred to the pending import.
                 _uiState.update { it.copy(hasPendingImport = true) }
             } catch (e: CancellationException) {
@@ -930,12 +945,19 @@ class VaultViewModel @JvmOverloads constructor(
     }
 
     fun confirmPendingImport(password: CharArray, legacy: Boolean, skipDuplicates: Boolean) {
+        val selectedAt = pendingImportSetAt
+        if (selectedAt != null && elapsedRealtime() - selectedAt >= PENDING_IMPORT_TTL_MS) {
+            password.fill('\u0000')
+            expirePendingImport()
+            return
+        }
         val bytes = pendingImport
         if (!SessionManager.hasKey() || bytes == null) {
             password.fill('\u0000')
             return
         }
         val generation = backupGeneration
+        cancelPendingImportExpiry()
         pendingImport = null
         _uiState.update { it.copy(hasPendingImport = false) }
         importBackup(bytes, password, legacy, skipDuplicates) { _, _, message ->
@@ -946,9 +968,23 @@ class VaultViewModel @JvmOverloads constructor(
     }
 
     fun discardPendingImport() {
+        cancelPendingImportExpiry()
         pendingImport?.fill(0)
         pendingImport = null
         _uiState.update { it.copy(hasPendingImport = false, isBackupBusy = false) }
+    }
+
+    private fun cancelPendingImportExpiry() {
+        pendingImportExpiryJob?.cancel()
+        pendingImportExpiryJob = null
+        pendingImportSetAt = null
+    }
+
+    private fun expirePendingImport() {
+        discardPendingImport()
+        _uiState.update {
+            it.copy(userMessage = "The selected backup expired. Pick it again to restore.")
+        }
     }
 
     private fun clearPendingBackups() {
@@ -978,7 +1014,6 @@ class VaultViewModel @JvmOverloads constructor(
     fun wipeAllData(onComplete: () -> Unit) {
         clearPendingBackups()
         clearEntryDrafts()
-        cancelSuppressedBackgroundLock()
         viewModelScope.launch {
             try {
                 repository.wipeEverything()

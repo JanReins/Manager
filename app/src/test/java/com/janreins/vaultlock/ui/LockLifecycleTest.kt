@@ -2,6 +2,7 @@ package com.janreins.vaultlock.ui
 
 import android.app.Application
 import android.content.Context
+import android.net.Uri
 import androidx.lifecycle.ViewModelStore
 import androidx.test.core.app.ApplicationProvider
 import com.janreins.vaultlock.crypto.SessionManager
@@ -9,13 +10,17 @@ import com.janreins.vaultlock.data.SecurityPreferences
 import javax.crypto.spec.SecretKeySpec
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withContext
 import org.junit.After
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
@@ -35,7 +40,8 @@ class LockLifecycleTest {
     private val dispatcher = StandardTestDispatcher()
     private lateinit var viewModel: VaultViewModel
     private lateinit var store: ViewModelStore
-    private var elapsed = 1_000L
+    private var written: ByteArray? = null
+    private var writtenWhileLocked = false
 
     @Before
     fun setUp() {
@@ -44,8 +50,16 @@ class LockLifecycleTest {
         val prefs = application.getSharedPreferences("lock_lifecycle_test", Context.MODE_PRIVATE)
         prefs.edit().clear().commit()
         SessionManager.setKey(SecretKeySpec(ByteArray(32) { 1 }, "AES"))
+        val documents = object : BackupDocumentStore {
+            override fun write(uri: Uri, bytes: ByteArray) {
+                writtenWhileLocked = !SessionManager.hasKey()
+                written = bytes.copyOf()
+            }
+            override fun delete(uri: Uri) = true
+            override fun read(uri: Uri): ByteArray = error("No import expected")
+        }
         viewModel = VaultViewModel(application, SecurityPreferences(application, customPrefs = prefs),
-            dispatcher, elapsedRealtime = { elapsed })
+            dispatcher, backupDocumentStore = documents)
         store = ViewModelStore().apply { put("vault", viewModel) }
     }
 
@@ -57,52 +71,53 @@ class LockLifecycleTest {
     }
 
     @Test
-    fun `picker suppression consumes one stop with a 120 second timeout`() = runTest {
+    fun `normal stop always locks for timeout 120`() = runTest {
         runCurrent()
         viewModel.setAutoLockDuration(120)
-        viewModel.suppressNextBackgroundLock()
-        viewModel.onActivityStopped(false)
-        assertTrue(viewModel.uiState.value.isUnlocked)
-        assertTrue(SessionManager.hasKey())
-        viewModel.onActivityStopped(false)
-        assertFalse(viewModel.uiState.value.isUnlocked)
-    }
-
-    @Test
-    fun `immediate background lock cannot be suppressed`() = runTest {
-        runCurrent()
-        viewModel.setAutoLockDuration(0)
-        viewModel.suppressNextBackgroundLock()
         viewModel.onActivityStopped(false)
         assertFalse(viewModel.uiState.value.isUnlocked)
         assertFalse(SessionManager.hasKey())
     }
 
     @Test
-    fun `switching to immediate lock invalidates an armed suppression`() = runTest {
+    fun `normal stop always locks for timeout 0`() = runTest {
         runCurrent()
-        viewModel.suppressNextBackgroundLock()
         viewModel.setAutoLockDuration(0)
         viewModel.onActivityStopped(false)
+        assertFalse(viewModel.uiState.value.isUnlocked)
         assertFalse(SessionManager.hasKey())
     }
 
     @Test
-    fun `cancelling suppression after launch failure restores next stop lock`() = runTest {
+    fun `stop during an open export picker locks and completion writes ciphertext while locked`() = runTest {
         runCurrent()
-        viewModel.suppressNextBackgroundLock()
-        viewModel.cancelSuppressedBackgroundLock()
+        viewModel.exportBackup("BackupPassword123!".toCharArray())
+        awaitState { viewModel.uiState.value.exportReadyFileName != null }
+        val pending = VaultViewModel::class.java.getDeclaredField("pendingExport")
+            .apply { isAccessible = true }.get(viewModel) as ByteArray
+        val ciphertext = pending.copyOf()
+        // The UI consumes the filename immediately before opening CreateDocument.
+        viewModel.consumeExportReadyFileName()
         viewModel.onActivityStopped(false)
         assertFalse(viewModel.uiState.value.isUnlocked)
+        assertFalse(SessionManager.hasKey())
+        viewModel.completeExport(Uri.parse("content://lock-lifecycle/backup.vault"))
+        awaitState { !viewModel.uiState.value.isBackupBusy }
+        assertArrayEquals(ciphertext, written)
+        assertTrue(writtenWhileLocked)
+        assertTrue(pending.all { it == 0.toByte() })
+        assertFalse(viewModel.uiState.value.isUnlocked)
+        assertFalse(SessionManager.hasKey())
     }
 
-    @Test
-    fun `stale picker suppression does not consume a stop`() = runTest {
-        runCurrent()
-        viewModel.suppressNextBackgroundLock()
-        elapsed += VaultViewModel.PICKER_SUPPRESS_WINDOW_MS + 1
-        viewModel.onActivityStopped(false)
-        assertFalse(viewModel.uiState.value.isUnlocked)
+    private suspend fun TestScope.awaitState(condition: () -> Boolean) {
+        val deadline = System.nanoTime() + 40_000_000_000L
+        while (true) {
+            runCurrent()
+            if (condition()) return
+            check(System.nanoTime() < deadline) { "Timed out waiting for backup IO" }
+            withContext(Dispatchers.IO) { delay(5) }
+        }
     }
 
     @Test
@@ -189,5 +204,16 @@ class LockLifecycleTest {
         assertEquals("", discarded.password)
         assertNotSame(discarded, viewModel.entryDraft("discard"))
         assertSame(retained, viewModel.entryDraft("keep"))
+    }
+
+    @Test
+    fun `session lock collector clears editor drafts`() = runTest {
+        runCurrent()
+        val draft = viewModel.entryDraft("editor").apply { password = "secret" }
+        SessionManager.lock()
+        runCurrent()
+        assertEquals("", draft.password)
+        assertNotSame(draft, viewModel.entryDraft("editor"))
+        assertFalse(viewModel.uiState.value.isUnlocked)
     }
 }

@@ -50,10 +50,10 @@ fun VaultNavHost(
         ActivityResultContracts.GetContent()
     ) { uri -> viewModel.onImportFilePicked(uri) }
 
-    LaunchedEffect(uiState.exportReadyFileName) {
+    LaunchedEffect(uiState.exportReadyFileName, uiState.isUnlocked) {
+        if (!uiState.isUnlocked) return@LaunchedEffect
         uiState.exportReadyFileName?.let { fileName ->
             viewModel.consumeExportReadyFileName()
-            viewModel.suppressNextBackgroundLock()
             try {
                 saveBackupLauncher.launch(fileName)
             } catch (_: Exception) {
@@ -133,7 +133,6 @@ fun VaultNavHost(
                     onWipeApp = onWipeApp,
                     onRestoreBackup = {
                         if (viewModel.beginImportPicker()) {
-                            viewModel.suppressNextBackgroundLock()
                             try {
                                 restoreBackupLauncher.launch("*/*")
                             } catch (_: Exception) {

@@ -14,8 +14,10 @@ import javax.crypto.spec.SecretKeySpec
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -44,6 +46,7 @@ class BackupPickerFlowTest {
     private lateinit var viewModel: VaultViewModel
     private lateinit var store: ViewModelStore
     private lateinit var documents: FakeDocumentStore
+    private var elapsed = 1_000L
 
     private class FakeDocumentStore : BackupDocumentStore {
         var input = ByteArray(40) { (it + 1).toByte() }
@@ -52,6 +55,7 @@ class BackupPickerFlowTest {
         var deletedUri: Uri? = null
         var failWrite = false
         var failDelete = false
+        var deleteResult = true
 
         override fun write(uri: Uri, bytes: ByteArray) {
             if (failWrite) throw IOException("Cannot write")
@@ -62,7 +66,7 @@ class BackupPickerFlowTest {
         override fun delete(uri: Uri): Boolean {
             deletedUri = uri
             if (failDelete) throw IOException("Cannot delete")
-            return true
+            return deleteResult
         }
 
         override fun read(uri: Uri): ByteArray = ByteArrayInputStream(input).use {
@@ -79,7 +83,7 @@ class BackupPickerFlowTest {
         SessionManager.setKey(SecretKeySpec(ByteArray(32) { 1 }, "AES"))
         documents = FakeDocumentStore()
         viewModel = VaultViewModel(application, SecurityPreferences(application, customPrefs = prefs),
-            dispatcher, elapsedRealtime = { 1_000L }, backupDocumentStore = documents)
+            dispatcher, elapsedRealtime = { elapsed }, backupDocumentStore = documents)
         store = ViewModelStore().apply { put("vault", viewModel) }
     }
 
@@ -138,11 +142,10 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `export cancellation zeroes pending bytes and clears suppression`() = runTest {
+    fun `export cancellation zeroes pending bytes and clears busy state`() = runTest {
         runCurrent()
         val bytes = byteArrayOf(1, 2, 3, 4)
         seedExport(bytes)
-        viewModel.suppressNextBackgroundLock()
         viewModel.completeExport(null)
         assertTrue(bytes.all { it == 0.toByte() })
         assertNull(pendingBytes("pendingExport"))
@@ -153,9 +156,8 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `missing export data deletes empty document and reports lost data even if delete fails`() = runTest {
+    fun `missing export data deletes empty document and reports lost data`() = runTest {
         runCurrent()
-        documents.failDelete = true
         viewModel.lockVault()
         viewModel.completeExport(uri)
         awaitState { !viewModel.uiState.value.isBackupBusy }
@@ -179,11 +181,72 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `picker launch failure clears suppression busy state and export bytes`() = runTest {
+    fun `missing export data reports empty file when deletion returns false or throws`() = runTest {
+        runCurrent()
+        viewModel.lockVault()
+        for (throws in listOf(false, true)) {
+            documents.failDelete = throws
+            documents.deleteResult = false
+            viewModel.completeExport(uri)
+            awaitState { !viewModel.uiState.value.isBackupBusy }
+            assertEquals(uri, documents.deletedUri)
+            assertNull(documents.written)
+            assertEquals(
+                "Backup was not saved: the encrypted data was lost. An empty file was left in the chosen folder; delete it, then unlock and export again.",
+                viewModel.uiState.value.userMessage
+            )
+        }
+    }
+
+    @Test
+    fun `write failure reports possible empty file when deletion returns false or throws`() = runTest {
+        runCurrent()
+        documents.failWrite = true
+        for (throws in listOf(false, true)) {
+            val bytes = byteArrayOf(1, 2, 3, 4)
+            seedExport(bytes)
+            documents.failDelete = throws
+            documents.deleteResult = false
+            viewModel.completeExport(uri)
+            awaitState { !viewModel.uiState.value.isBackupBusy }
+            assertEquals(uri, documents.deletedUri)
+            assertTrue(bytes.all { it == 0.toByte() })
+            assertNull(pendingBytes("pendingExport"))
+            assertEquals(
+                "Backup could not be saved. An empty file may have been left in the chosen folder. Try another destination.",
+                viewModel.uiState.value.userMessage
+            )
+        }
+    }
+
+    @Test
+    fun `unlaunched export is discarded by explicit and observed session locks`() = runTest {
+        runCurrent()
+        for (externalLock in listOf(false, true)) {
+            SessionManager.setKey(SecretKeySpec(ByteArray(32) { 1 }, "AES"))
+            runCurrent()
+            viewModel.exportBackup("BackupPassword123!".toCharArray())
+            awaitState { viewModel.uiState.value.exportReadyFileName != null }
+            val bytes = checkNotNull(pendingBytes("pendingExport"))
+            if (externalLock) {
+                SessionManager.lock()
+                runCurrent()
+            } else {
+                viewModel.lockVault()
+            }
+            assertTrue(bytes.all { it == 0.toByte() })
+            assertNull(pendingBytes("pendingExport"))
+            assertNull(viewModel.uiState.value.exportReadyFileName)
+            assertFalse(viewModel.uiState.value.isBackupBusy)
+            assertFalse(viewModel.uiState.value.isUnlocked)
+        }
+    }
+
+    @Test
+    fun `picker launch failure clears busy state and export bytes`() = runTest {
         runCurrent()
         val bytes = byteArrayOf(1, 2, 3, 4)
         seedExport(bytes)
-        viewModel.suppressNextBackgroundLock()
         viewModel.onBackupPickerLaunchFailed(export = true)
         assertTrue(bytes.all { it == 0.toByte() })
         assertNull(pendingBytes("pendingExport"))
@@ -193,10 +256,9 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `import result clears suppression before reading`() = runTest {
+    fun `import result can finish reading after a background lock`() = runTest {
         runCurrent()
         assertTrue(viewModel.beginImportPicker())
-        viewModel.suppressNextBackgroundLock()
         viewModel.onImportFilePicked(uri)
         viewModel.onActivityStopped(false)
         assertFalse(SessionManager.hasKey())
@@ -205,10 +267,9 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `null import result clears suppression and busy state`() = runTest {
+    fun `null import result clears busy state`() = runTest {
         runCurrent()
         viewModel.beginImportPicker()
-        viewModel.suppressNextBackgroundLock()
         viewModel.onImportFilePicked(null)
         assertFalse(viewModel.uiState.value.isBackupBusy)
         assertFalse(viewModel.uiState.value.hasPendingImport)
@@ -226,7 +287,8 @@ class BackupPickerFlowTest {
         awaitState { viewModel.uiState.value.hasPendingImport }
         val vmBytes = checkNotNull(pendingBytes("pendingImport"))
         assertArrayEquals(documents.input, vmBytes)
-        assertEquals(countBefore, withContext(Dispatchers.IO) { dao.getCount() })
+        // runBlocking: suspending here would let the test scheduler skip ahead to the import expiry.
+        assertEquals(countBefore, runBlocking(Dispatchers.IO) { dao.getCount() })
         assertNull(viewModel.uiState.value.userMessage)
         assertFalse(viewModel.uiState.value.isUnlocked && viewModel.uiState.value.hasPendingImport)
 
@@ -257,6 +319,94 @@ class BackupPickerFlowTest {
     }
 
     @Test
+    fun `pending import expires at ten minutes while locked and zeroes ciphertext`() = runTest {
+        runCurrent()
+        viewModel.lockVault()
+        viewModel.onImportFilePicked(uri)
+        awaitState { viewModel.uiState.value.hasPendingImport }
+        val bytes = checkNotNull(pendingBytes("pendingImport"))
+        advanceTimeBy(VaultViewModel.PENDING_IMPORT_TTL_MS - 1)
+        runCurrent()
+        assertTrue(viewModel.uiState.value.hasPendingImport)
+        assertArrayEquals(documents.input, bytes)
+        assertNull(viewModel.uiState.value.userMessage)
+        advanceTimeBy(1)
+        runCurrent()
+        assertTrue(bytes.all { it == 0.toByte() })
+        assertNull(pendingBytes("pendingImport"))
+        assertFalse(viewModel.uiState.value.hasPendingImport)
+        assertFalse(viewModel.uiState.value.isBackupBusy)
+        assertEquals("The selected backup expired. Pick it again to restore.",
+            viewModel.uiState.value.userMessage)
+        assertFalse(SessionManager.hasKey())
+    }
+
+    @Test
+    fun `confirmation checks monotonic expiry even before the expiry job runs`() = runTest {
+        runCurrent()
+        viewModel.onImportFilePicked(uri)
+        awaitState { viewModel.uiState.value.hasPendingImport }
+        val bytes = checkNotNull(pendingBytes("pendingImport"))
+        val password = "backup password".toCharArray()
+        // Advance only the injected clock, leaving the coroutine scheduler unchanged.
+        elapsed += VaultViewModel.PENDING_IMPORT_TTL_MS
+        assertTrue(viewModel.uiState.value.hasPendingImport)
+        viewModel.confirmPendingImport(password, legacy = false, skipDuplicates = true)
+        assertTrue(password.all { it == '\u0000' })
+        assertTrue(bytes.all { it == 0.toByte() })
+        assertNull(pendingBytes("pendingImport"))
+        assertFalse(viewModel.uiState.value.hasPendingImport)
+        assertFalse(viewModel.uiState.value.isBackupBusy)
+        assertEquals("The selected backup expired. Pick it again to restore.",
+            viewModel.uiState.value.userMessage)
+        viewModel.consumeUserMessage()
+        advanceTimeBy(VaultViewModel.PENDING_IMPORT_TTL_MS)
+        runCurrent()
+        assertNull(viewModel.uiState.value.userMessage)
+    }
+
+    @Test
+    fun `replacement zeroes old import and starts a fresh expiry timer`() = runTest {
+        runCurrent()
+        viewModel.lockVault()
+        viewModel.onImportFilePicked(uri)
+        awaitState { viewModel.uiState.value.hasPendingImport }
+        val old = checkNotNull(pendingBytes("pendingImport"))
+        advanceTimeBy(VaultViewModel.PENDING_IMPORT_TTL_MS / 2)
+        elapsed += VaultViewModel.PENDING_IMPORT_TTL_MS / 2
+        viewModel.onImportFilePicked(uri)
+        awaitState { pendingBytes("pendingImport") !== old }
+        val replacement = checkNotNull(pendingBytes("pendingImport"))
+        assertTrue(old.all { it == 0.toByte() })
+        advanceTimeBy(VaultViewModel.PENDING_IMPORT_TTL_MS / 2)
+        runCurrent()
+        assertTrue(viewModel.uiState.value.hasPendingImport)
+        assertArrayEquals(documents.input, replacement)
+        assertNull(viewModel.uiState.value.userMessage)
+        advanceTimeBy(VaultViewModel.PENDING_IMPORT_TTL_MS / 2)
+        runCurrent()
+        assertTrue(replacement.all { it == 0.toByte() })
+        assertFalse(viewModel.uiState.value.hasPendingImport)
+        assertEquals("The selected backup expired. Pick it again to restore.",
+            viewModel.uiState.value.userMessage)
+    }
+
+    @Test
+    fun `discard cancels pending import expiry`() = runTest {
+        runCurrent()
+        viewModel.onImportFilePicked(uri)
+        awaitState { viewModel.uiState.value.hasPendingImport }
+        val bytes = checkNotNull(pendingBytes("pendingImport"))
+        viewModel.discardPendingImport()
+        assertTrue(bytes.all { it == 0.toByte() })
+        advanceTimeBy(VaultViewModel.PENDING_IMPORT_TTL_MS)
+        runCurrent()
+        assertNull(viewModel.uiState.value.userMessage)
+        assertFalse(viewModel.uiState.value.hasPendingImport)
+        assertFalse(viewModel.uiState.value.isBackupBusy)
+    }
+
+    @Test
     fun `confirmation after unlock uses pending import and clears it on restore failure`() = runTest {
         runCurrent()
         viewModel.lockVault()
@@ -273,6 +423,10 @@ class BackupPickerFlowTest {
         assertTrue(imported.all { it == 0.toByte() })
         assertTrue(password.all { it == '\u0000' })
         assertTrue(checkNotNull(viewModel.uiState.value.userMessage).startsWith("Restore failed:"))
+        viewModel.consumeUserMessage()
+        advanceTimeBy(VaultViewModel.PENDING_IMPORT_TTL_MS)
+        runCurrent()
+        assertNull(viewModel.uiState.value.userMessage)
     }
 
     @Test
@@ -295,6 +449,9 @@ class BackupPickerFlowTest {
         assertFalse(viewModel.uiState.value.isBackupBusy)
         awaitState { completed }
         assertFalse(SessionManager.hasKey())
+        advanceTimeBy(VaultViewModel.PENDING_IMPORT_TTL_MS)
+        runCurrent()
+        assertNull(viewModel.uiState.value.userMessage)
     }
 
     @Test
@@ -310,5 +467,8 @@ class BackupPickerFlowTest {
         assertTrue(imported.all { it == 0.toByte() })
         assertNull(pendingBytes("pendingExport"))
         assertNull(pendingBytes("pendingImport"))
+        advanceTimeBy(VaultViewModel.PENDING_IMPORT_TTL_MS)
+        runCurrent()
+        assertNull(viewModel.uiState.value.userMessage)
     }
 }
