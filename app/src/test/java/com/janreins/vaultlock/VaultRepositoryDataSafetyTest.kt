@@ -102,7 +102,7 @@ class VaultRepositoryDataSafetyTest {
     @Test
     fun `export refuses unreadable rows`() = runTest {
         seedMixedKeys()
-        expectDecryptionFailure { repository.createEncryptedBackupPayload() }
+        expectDecryptionFailure { repository.createEncryptedBackupPayload("BackupPassword123!".toCharArray()) }
     }
 
     @Test

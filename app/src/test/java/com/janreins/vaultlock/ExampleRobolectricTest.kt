@@ -23,7 +23,7 @@ class ExampleRobolectricTest {
     fun `read app name from context`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val appName = context.getString(R.string.app_name)
-        assertEquals("VaultLock", appName)
+        assertEquals(if (BuildConfig.DEBUG) "VaultLock Debug" else "VaultLock", appName)
     }
 
     @Test

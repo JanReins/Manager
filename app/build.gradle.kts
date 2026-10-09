@@ -13,8 +13,8 @@ android {
     applicationId = "com.janreins.vaultlock"
     minSdk = 26
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0.0"
+    versionCode = 2
+    versionName = "1.1.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -42,7 +42,11 @@ android {
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
       signingConfigs.findByName("release")?.let { signingConfig = it }
     }
-    // Use Android's generated debug keystore so a clean checkout can build.
+    debug {
+      applicationIdSuffix = ".debug"
+      versionNameSuffix = "-debug"
+    }
+    // Debug builds coexist with the production vault; never uninstall production to test.
   }
   compileOptions {
     sourceCompatibility = JavaVersion.VERSION_11

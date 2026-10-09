@@ -16,6 +16,7 @@ import com.janreins.vaultlock.crypto.BiometricHelper
 import com.janreins.vaultlock.crypto.CryptoManager
 import com.janreins.vaultlock.crypto.SessionManager
 import com.janreins.vaultlock.data.SecurityPreferences
+import com.janreins.vaultlock.data.VaultAccess
 import com.janreins.vaultlock.data.VaultDatabase
 import com.janreins.vaultlock.data.VaultEntry
 import com.janreins.vaultlock.data.VaultRepository
@@ -36,6 +37,7 @@ import java.util.UUID
 import javax.crypto.SecretKey
 
 data class VaultUiState(
+    val isSaving: Boolean = false,
     val isMasterPasswordSet: Boolean = false,
     val isUnlocked: Boolean = false,
     val isBiometricAvailable: Boolean = false,
@@ -236,10 +238,16 @@ class VaultViewModel @JvmOverloads constructor(
             onComplete(false, "Password must be at least 8 characters long")
             return
         }
+        if (!VaultAccess.authentication.tryLock()) {
+            onComplete(false, "Another security operation is in progress.")
+            return
+        }
+        val sessionGeneration = SessionManager.generation()
         viewModelScope.launch {
             try {
                 val derivedKey = withContext(kdfDispatcher) { securityPreferences.setupMasterPassword(password.toCharArray()) }
-                SessionManager.setKey(derivedKey)
+                _uiState.update { it.copy(isMasterPasswordSet = true) }
+                check(SessionManager.setKeyIfCurrent(derivedKey, sessionGeneration)) { "Setup completed. Unlock to continue." }
                 _uiState.update {
                     it.copy(
                         isMasterPasswordSet = true,
@@ -252,6 +260,7 @@ class VaultViewModel @JvmOverloads constructor(
                         activity = activity,
                         masterKeyToWrap = derivedKey,
                         onEnrolled = { wrappedKey ->
+                            if (SessionManager.activeKey.value !== derivedKey) return@promptBiometricEnrollment
                             securityPreferences.saveBiometricWrappedKey(wrappedKey)
                             _uiState.update { it.copy(isBiometricEnabled = true) }
                             onComplete(true, "Master Password created and biometric unlock registered")
@@ -272,7 +281,7 @@ class VaultViewModel @JvmOverloads constructor(
             } catch (e: Exception) {
                 onComplete(false, "Setup failed: ${e.localizedMessage}")
             }
-        }
+        }.invokeOnCompletion { VaultAccess.authentication.unlock() }
     }
 
     /**
@@ -290,6 +299,11 @@ class VaultViewModel @JvmOverloads constructor(
             return
         }
 
+        if (!VaultAccess.authentication.tryLock()) {
+            onResult(false, "Another security operation is in progress.")
+            return
+        }
+        val sessionGeneration = SessionManager.generation()
         viewModelScope.launch {
             try {
                 var key = withContext(kdfDispatcher) { securityPreferences.verifyAndDeriveKey(password.toCharArray()) }
@@ -327,7 +341,7 @@ class VaultViewModel @JvmOverloads constructor(
                 }
                 if (key != null) {
                     securityPreferences.resetFailedUnlockAttempts()
-                    SessionManager.setKey(key)
+                    check(SessionManager.setKeyIfCurrent(key, sessionGeneration)) { "Unlock cancelled because the app was locked." }
                     _uiState.update { it.copy(isUnlocked = true, errorMessage = null, lockoutRemainingSeconds = 0) }
                     onResult(true, "Vault Unlocked")
                 } else {
@@ -342,7 +356,7 @@ class VaultViewModel @JvmOverloads constructor(
             } catch (e: Exception) {
                 onResult(false, "Authentication error: ${e.localizedMessage}")
             }
-        }
+        }.invokeOnCompletion { VaultAccess.authentication.unlock() }
     }
 
     /**
@@ -368,6 +382,7 @@ class VaultViewModel @JvmOverloads constructor(
             return
         }
 
+        val sessionGeneration = SessionManager.generation()
         BiometricHelper.promptBiometricUnlock(
             activity = activity,
             wrappedKeyBase64 = wrappedKey,
@@ -376,7 +391,9 @@ class VaultViewModel @JvmOverloads constructor(
                 _uiState.update { it.copy(isBiometricEnabled = false) }
             },
             onSuccess = { secretKey ->
-                if (securityPreferences.hasPendingMasterPasswordChange()) {
+                if (SessionManager.generation() != sessionGeneration || VaultAccess.authentication.isLocked) {
+                    onResult(false, "Unlock cancelled. Please try again.")
+                } else if (securityPreferences.hasPendingMasterPasswordChange()) {
                     onResult(false, "A master password change was interrupted. Unlock with your master password to recover it.")
                 } else if (!securityPreferences.verifyKey(secretKey)) {
                     securityPreferences.disableBiometric()
@@ -385,7 +402,7 @@ class VaultViewModel @JvmOverloads constructor(
                     onResult(false, msg)
                 } else {
                     securityPreferences.resetFailedUnlockAttempts()
-                    SessionManager.setKey(secretKey)
+                    if (!SessionManager.setKeyIfCurrent(secretKey, sessionGeneration)) return@promptBiometricUnlock
                     _uiState.update { it.copy(isUnlocked = true, errorMessage = null, lockoutRemainingSeconds = 0) }
                     onResult(true, "Unlocked via Biometrics")
                 }
@@ -441,14 +458,18 @@ class VaultViewModel @JvmOverloads constructor(
     }
 
     fun saveEntry(entry: VaultEntry, onComplete: () -> Unit = {}) {
+        if (_uiState.value.isSaving || !SessionManager.hasKey()) return
+        _uiState.update { it.copy(isSaving = true) }
         viewModelScope.launch {
             try {
                 repository.saveEntry(entry)
-                onComplete()
+                if (SessionManager.hasKey()) onComplete()
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 _uiState.update { it.copy(userMessage = "Save failed: ${e.localizedMessage}") }
+            } finally {
+                _uiState.update { it.copy(isSaving = false) }
             }
         }
     }
@@ -494,6 +515,11 @@ class VaultViewModel @JvmOverloads constructor(
             return
         }
 
+        if (!VaultAccess.authentication.tryLock()) {
+            onResult(false, "Another security operation is in progress.")
+            return
+        }
+        val sessionGeneration = SessionManager.generation()
         viewModelScope.launch {
             try {
                 val remainingMs = securityPreferences.getLockoutRemainingMillis()
@@ -523,22 +549,22 @@ class VaultViewModel @JvmOverloads constructor(
                     onResult(false, "Unlock with your master password to finish the interrupted change before changing it again.")
                     return@launch
                 }
-                if (!securityPreferences.stagePendingMasterPasswordChange(prepared)) {
-                    throw IllegalStateException("Failed to stage new Master Password; vault was not changed")
-                }
-                try {
-                    repository.reEncryptAll(oldKey, prepared.secretKey)
-                } catch (e: CancellationException) {
-                    // IO may have committed before cancellation was delivered. Keep recovery metadata.
-                    throw e
-                } catch (e: Exception) {
-                    securityPreferences.clearPendingMasterPasswordChange()
-                    throw e
-                }
-                // The database now needs this key even if the preference commit fails.
-                SessionManager.setKey(prepared.secretKey)
-                val committed = securityPreferences.commitMasterPasswordChange(prepared)
-
+                var committed = false
+                repository.reEncryptAll(oldKey, prepared.secretKey,
+                    beforeWrite = {
+                        check(SessionManager.generation() == sessionGeneration && SessionManager.hasKey()) {
+                            "Vault locked. Unlock before changing the password."
+                        }
+                        check(securityPreferences.stagePendingMasterPasswordChange(prepared)) {
+                            "Failed to stage new Master Password; vault was not changed"
+                        }
+                    },
+                    afterWrite = {
+                        // Persist recovery even after background lock, but never reopen a stale session.
+                        committed = securityPreferences.commitMasterPasswordChange(prepared)
+                        SessionManager.setKeyIfCurrent(prepared.secretKey, sessionGeneration)
+                    }
+                )
                 // Purge the old wrapped key before attempting enrollment with the new key.
                 val wasBiometricEnabled = securityPreferences.isBiometricEnabled
                 if (wasBiometricEnabled) {
@@ -549,11 +575,12 @@ class VaultViewModel @JvmOverloads constructor(
                     onResult(false, "Vault re-encrypted, but failed to persist new Master Password. Your NEW master password is required to finish recovery on the next unlock.")
                     return@launch
                 }
-                if (wasBiometricEnabled && activity != null) {
+                if (wasBiometricEnabled && activity != null && SessionManager.activeKey.value === prepared.secretKey) {
                     BiometricHelper.promptBiometricEnrollment(
                         activity = activity,
                         masterKeyToWrap = prepared.secretKey,
                         onEnrolled = { wrappedKey ->
+                            if (SessionManager.activeKey.value !== prepared.secretKey) return@promptBiometricEnrollment
                             securityPreferences.saveBiometricWrappedKey(wrappedKey)
                             _uiState.update { it.copy(isBiometricEnabled = true) }
                             onResult(true, "Master Password changed & biometric updated")
@@ -574,7 +601,7 @@ class VaultViewModel @JvmOverloads constructor(
             } catch (e: Exception) {
                 onResult(false, "Failed to change password: ${e.message}")
             }
-        }
+        }.invokeOnCompletion { VaultAccess.authentication.unlock() }
     }
 
     fun setBiometricEnabled(enabled: Boolean, activity: FragmentActivity?, onResult: (Boolean, String) -> Unit) {
@@ -588,6 +615,10 @@ class VaultViewModel @JvmOverloads constructor(
                 activity = activity,
                 masterKeyToWrap = currentKey,
                 onEnrolled = { wrappedKey ->
+                    if (SessionManager.activeKey.value !== currentKey || !securityPreferences.verifyKey(currentKey)) {
+                        onResult(false, "Session changed. Unlock and try again.")
+                        return@promptBiometricEnrollment
+                    }
                     securityPreferences.saveBiometricWrappedKey(wrappedKey)
                     _uiState.update { it.copy(isBiometricEnabled = true) }
                     onResult(true, "Biometric unlock enabled")
@@ -706,30 +737,35 @@ class VaultViewModel @JvmOverloads constructor(
         }
     }
 
-    fun exportBackup(onReady: (ByteArray?) -> Unit) {
+    fun exportBackup(password: CharArray, onReady: (ByteArray?) -> Unit) {
         _uiState.update { it.copy(errorMessage = null) }
         viewModelScope.launch {
             try {
-                val payload = repository.createEncryptedBackupPayload()
+                val payload = repository.createEncryptedBackupPayload(password)
                 onReady(payload)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 _uiState.update { it.copy(errorMessage = "Backup failed: ${e.localizedMessage}") }
                 onReady(null)
+            } finally {
+                password.fill('\u0000')
             }
         }
     }
 
-    fun importBackup(encryptedBytes: ByteArray, onComplete: (Boolean, Int, String) -> Unit) {
+    fun importBackup(encryptedBytes: ByteArray, password: CharArray, legacy: Boolean = false, skipDuplicates: Boolean = true, onComplete: (Boolean, Int, String) -> Unit) {
         viewModelScope.launch {
             try {
-                val restoredCount = repository.restoreEncryptedBackupPayload(encryptedBytes)
+                val restoredCount = repository.restoreEncryptedBackupPayload(encryptedBytes, password, legacy, skipDuplicates)
                 onComplete(true, restoredCount, "Successfully restored $restoredCount entries")
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
-                onComplete(false, 0, "Failed to restore backup: Invalid password or corrupted file")
+                onComplete(false, 0, "Restore failed: wrong password, unsupported or damaged backup, or session changed. No entries imported.")
+            } finally {
+                password.fill('\u0000')
+                encryptedBytes.fill(0)
             }
         }
     }

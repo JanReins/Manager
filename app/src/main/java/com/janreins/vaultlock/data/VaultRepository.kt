@@ -1,8 +1,10 @@
 package com.janreins.vaultlock.data
 
+import com.janreins.vaultlock.crypto.BackupEnvelope
 import com.janreins.vaultlock.crypto.CryptoManager
 import com.janreins.vaultlock.crypto.SessionManager
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flowOn
@@ -18,6 +20,16 @@ class VaultRepository(
     private val vaultDao: VaultDao,
     private val securityPreferences: SecurityPreferences
 ) {
+    private suspend fun <T> mutate(block: suspend (SecretKey) -> T): T {
+        val generation = SessionManager.generation()
+        return withContext(Dispatchers.IO) {
+            VaultAccess.mutations.withLock {
+                check(SessionManager.generation() == generation) { "Session changed. Please retry." }
+                block(SessionManager.getKey())
+            }
+        }
+    }
+
     /**
      * Decrypts database entities into domain models in real-time when the vault session is unlocked.
      */
@@ -37,14 +49,14 @@ class VaultRepository(
         entity.toDomain(key)
     }
 
-    suspend fun saveEntry(entry: VaultEntry) = withContext(Dispatchers.IO) {
-        val key = SessionManager.getKey()
+    suspend fun saveEntry(entry: VaultEntry) = mutate { key ->
         if (entry.id != 0L) {
             val existing = vaultDao.getEntryById(entry.id)
                 ?: throw IllegalStateException("Entry no longer exists")
             existing.toDomainStrict(key)
         }
         val entity = entry.toEntity(key)
+        check(SessionManager.activeKey.value === key) { "Vault locked before save." }
         if (entry.id == 0L) {
             vaultDao.insertEntry(entity)
         } else {
@@ -52,12 +64,12 @@ class VaultRepository(
         }
     }
 
-    suspend fun toggleFavorite(id: Long, isFavorite: Boolean) = withContext(Dispatchers.IO) {
-        val entity = vaultDao.getEntryById(id) ?: return@withContext
+    suspend fun toggleFavorite(id: Long, isFavorite: Boolean) = mutate { _ ->
+        val entity = vaultDao.getEntryById(id) ?: return@mutate
         vaultDao.updateEntry(entity.copy(isFavorite = isFavorite, updatedAt = System.currentTimeMillis()))
     }
 
-    suspend fun deleteEntry(id: Long) = withContext(Dispatchers.IO) {
+    suspend fun deleteEntry(id: Long) = mutate { _ ->
         vaultDao.deleteEntryById(id)
     }
 
@@ -72,22 +84,37 @@ class VaultRepository(
         }
     }
 
-    suspend fun reEncryptAll(oldKey: SecretKey, newKey: SecretKey) = withContext(Dispatchers.IO) {
-        val entities = vaultDao.getAllEntriesSync()
-        val updated = entities.map { entity ->
-            val domain = entity.toDomainStrict(oldKey)
-            domain.toEntity(newKey)
+    suspend fun reEncryptAll(
+        oldKey: SecretKey,
+        newKey: SecretKey,
+        beforeWrite: () -> Unit = {},
+        afterWrite: () -> Unit = {}
+    ) = withContext(Dispatchers.IO) {
+        VaultAccess.mutations.withLock {
+            val entities = vaultDao.getAllEntriesSync()
+            val updated = entities.map { it.toDomainStrict(oldKey).toEntity(newKey) }
+            beforeWrite()
+            try {
+                vaultDao.insertAll(updated)
+                // Credential promotion is inside the same gate as the row rewrite.
+                afterWrite()
+            } catch (failure: Throwable) {
+                // A cancelled Room continuation can hide a successful commit. Keep the journal
+                // and close the session BEFORE releasing the gate; no old-key writes may follow.
+                SessionManager.lock()
+                throw failure
+            }
         }
-        vaultDao.insertAll(updated)
     }
 
-    suspend fun createEncryptedBackupPayload(): ByteArray = withContext(Dispatchers.IO) {
-        val key = SessionManager.getKey()
+    suspend fun createEncryptedBackupPayload(password: CharArray): ByteArray = mutate { key ->
         val entities = vaultDao.getAllEntriesSync()
+        require(entities.size <= 50_000) { "Too many backup entries." }
         val itemsArray = JSONArray()
 
         for (entity in entities) {
             val domain = entity.toDomainStrict(key)
+            validateBackupEntry(domain)
             val jsonItem = JSONObject().apply {
                 put("id", domain.id)
                 put("title", domain.title)
@@ -105,48 +132,75 @@ class VaultRepository(
         }
 
         val backupRoot = JSONObject().apply {
-            put("version", 1)
+            put("version", 2)
             put("app", "VaultLock")
             put("timestamp", System.currentTimeMillis())
             put("items", itemsArray)
         }
 
         val rawBytes = backupRoot.toString().toByteArray(Charsets.UTF_8)
-        CryptoManager.encryptBytes(rawBytes, key)
+        try { BackupEnvelope.encrypt(rawBytes, password) } finally { rawBytes.fill(0) }
     }
 
-    suspend fun restoreEncryptedBackupPayload(encryptedBytes: ByteArray): Int = withContext(Dispatchers.IO) {
-        val key = SessionManager.getKey()
-        val decryptedBytes = CryptoManager.decryptBytes(encryptedBytes, key)
-        val jsonString = String(decryptedBytes, Charsets.UTF_8)
-        val root = JSONObject(jsonString)
-
-        val itemsArray = root.getJSONArray("items")
-        val restoredEntries = mutableListOf<VaultEntryEntity>()
-
-        for (i in 0 until itemsArray.length()) {
-            val obj = itemsArray.getJSONObject(i)
-            val entry = VaultEntry(
-                id = 0, // Generate new IDs on restore
-                title = obj.getString("title"),
-                username = obj.optString("username", ""),
-                password = obj.optString("password", ""),
-                url = obj.optString("url", ""),
-                notes = obj.optString("notes", ""),
-                totpSecret = obj.optString("totpSecret", ""),
-                category = obj.optString("category", "Login"),
-                isFavorite = obj.optBoolean("isFavorite", false),
-                createdAt = obj.optLong("createdAt", System.currentTimeMillis()),
-                updatedAt = System.currentTimeMillis()
-            )
-            restoredEntries.add(entry.toEntity(key))
+    /** Legacy import is explicit; never silently downgrade a damaged portable envelope. */
+    suspend fun restoreEncryptedBackupPayload(
+        encryptedBytes: ByteArray,
+        password: CharArray,
+        legacy: Boolean = false,
+        skipDuplicates: Boolean = true
+    ): Int = mutate { key ->
+        require(encryptedBytes.size in 28..BackupEnvelope.MAX_BYTES) { "Invalid backup size." }
+        val decryptedBytes = if (legacy) {
+            require(!BackupEnvelope.isPortable(encryptedBytes)) { "Use portable restore for this file." }
+            CryptoManager.decryptBytes(encryptedBytes, key)
+        } else BackupEnvelope.decrypt(encryptedBytes, password)
+        try {
+            val root = JSONObject(String(decryptedBytes, Charsets.UTF_8))
+            require(root.getString("app") == "VaultLock") { "Wrong backup application." }
+            require(root.getInt("version") == if (legacy) 1 else 2) { "Unsupported backup version." }
+            val items = root.getJSONArray("items")
+            require(items.length() <= 50_000) { "Too many backup entries." }
+            // Validate all entries before the single transactional Room batch insert.
+            val existing = if (skipDuplicates) vaultDao.getAllEntriesSync().map {
+                it.toDomainStrict(key).identity()
+            }.toMutableSet() else mutableSetOf()
+            val restored = mutableListOf<VaultEntryEntity>()
+            for (i in 0 until items.length()) {
+                val obj = items.getJSONObject(i)
+                fun field(name: String): String {
+                    val value = obj.get(name)
+                    require(value is String && value.length <= 1_000_000) { "Invalid entry field: $name" }
+                    return value
+                }
+                val entry = VaultEntry(
+                    title = field("title"), username = field("username"), password = field("password"),
+                    url = field("url"), notes = field("notes"), totpSecret = field("totpSecret"),
+                    category = field("category"), isFavorite = obj.getBoolean("isFavorite"),
+                    createdAt = obj.getLong("createdAt"), updatedAt = obj.getLong("updatedAt")
+                )
+                validateBackupEntry(entry)
+                if (!skipDuplicates || existing.add(entry.identity())) {
+                    restored.add(entry.toEntity(key).copy(updatedAt = entry.updatedAt))
+                }
+            }
+            check(SessionManager.activeKey.value === key) { "Vault locked before import." }
+            vaultDao.insertAll(restored)
+            restored.size
+        } finally {
+            decryptedBytes.fill(0)
+            password.fill('\u0000')
         }
-
-        vaultDao.insertAll(restoredEntries)
-        restoredEntries.size
     }
 
-    suspend fun wipeEverything() = withContext(Dispatchers.IO) {
+    private fun validateBackupEntry(entry: VaultEntry) {
+        require(entry.title.isNotBlank() && entry.createdAt >= 0 && entry.updatedAt >= 0) { "Invalid entry metadata." }
+        require(entry.identity().all { it.length <= 1_000_000 }) { "Entry field exceeds backup limit." }
+    }
+
+    // Compare exact content, excluding local IDs/timestamps/favorite state. Never replace existing entries.
+    private fun VaultEntry.identity(): List<String> = listOf(title, username, password, url, notes, totpSecret, category)
+
+    suspend fun wipeEverything() = mutate { _ ->
         vaultDao.deleteAllEntries()
         securityPreferences.wipeAll()
         SessionManager.lock()

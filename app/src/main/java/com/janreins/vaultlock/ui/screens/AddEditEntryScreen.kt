@@ -435,7 +435,7 @@ fun AddEditEntryScreen(
                         }
                     }
                 },
-                enabled = !isEdit || loadedEntryId == entryId,
+                enabled = !uiState.isSaving && (!isEdit || loadedEntryId == entryId),
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(54.dp)
@@ -450,7 +450,7 @@ fun AddEditEntryScreen(
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    text = if (isEdit) "Save Changes" else "Save Encrypted Item",
+                    text = if (uiState.isSaving) "Saving…" else if (isEdit) "Save Changes" else "Save Encrypted Item",
                     fontSize = 16.sp,
                     fontWeight = FontWeight.Bold,
                     color = Color(0xFF0F172A)

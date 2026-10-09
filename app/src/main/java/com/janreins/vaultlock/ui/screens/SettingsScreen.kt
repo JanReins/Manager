@@ -53,6 +53,9 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -101,6 +104,14 @@ fun SettingsScreen(
     var showWipeConfirmationDialog by remember { mutableStateOf(false) }
     var pendingBackup by remember { mutableStateOf<ByteArray?>(null) }
     var backupBusy by remember { mutableStateOf(false) }
+    var showExportPassword by remember { mutableStateOf(false) }
+    var pendingImport by remember { mutableStateOf<ByteArray?>(null) }
+    DisposableEffect(Unit) {
+        onDispose {
+            pendingBackup?.fill(0)
+            pendingImport?.fill(0)
+        }
+    }
 
     val saveBackupLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/octet-stream")
@@ -140,10 +151,7 @@ fun SettingsScreen(
                             "Cannot open the selected backup."
                         }.use { BackupFileIO.readBounded(it) }
                     }
-                    viewModel.importBackup(bytes) { _, _, message ->
-                        backupBusy = false
-                        coroutineScope.launch { snackbarHostState.showSnackbar(message) }
-                    }
+                    pendingImport = bytes
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -341,30 +349,7 @@ fun SettingsScreen(
                         title = "Export Encrypted Backup",
                         subtitle = "Creates an offline AES-256-GCM encrypted file",
                         onClick = {
-                            if (!backupBusy) {
-                              backupBusy = true
-                              viewModel.exportBackup { backupBytes ->
-                                if (backupBytes != null && backupBytes.size <= BackupFileIO.MAX_BACKUP_BYTES) {
-                                  try {
-                                    pendingBackup = backupBytes
-                                    viewModel.suppressNextBackgroundLock()
-                                    saveBackupLauncher.launch("VaultLock_Backup_${System.currentTimeMillis()}.vault")
-                                  } catch (_: Exception) {
-                                    pendingBackup = null
-                                    backupBytes.fill(0)
-                                    backupBusy = false
-                                    coroutineScope.launch { snackbarHostState.showSnackbar("Unable to open the save picker") }
-                                  }
-                                } else {
-                                    backupBusy = false
-                                    val message = if (backupBytes != null) {
-                                        backupBytes.fill(0)
-                                        "Backup exceeds the supported 16 MiB size."
-                                    } else viewModel.uiState.value.errorMessage ?: "Backup failed. Unlock the vault and try again."
-                                    coroutineScope.launch { snackbarHostState.showSnackbar(message) }
-                                }
-                              }
-                            }
+                            if (!backupBusy) showExportPassword = true
                         },
                         testTag = "setting_export_backup"
                     )
@@ -373,7 +358,7 @@ fun SettingsScreen(
                     SettingsRowItem(
                         icon = Icons.Default.Download,
                         title = "Restore Encrypted Backup",
-                        subtitle = "Adds entries to this vault; repeated restores create duplicates",
+                        subtitle = "Restore with a backup password; skip exact duplicates",
                         onClick = {
                           if (!backupBusy) {
                             backupBusy = true
@@ -392,7 +377,7 @@ fun SettingsScreen(
             }
 
             Text(
-                text = "Current backups only restore into the same vault with its original master key. Reinstalling, wiping the app, or changing the master password makes these backups unusable. Save to a local folder to keep the file offline.",
+                text = "New backups restore on another installation using their backup password. Keep that password separately: it cannot be recovered. Legacy backups still require the original vault key. Choose a local folder to keep files offline.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 8.dp)
@@ -444,6 +429,51 @@ fun SettingsScreen(
             }
 
             Spacer(modifier = Modifier.height(32.dp))
+        }
+
+        if (showExportPassword) {
+            BackupPasswordDialog(export = true,
+                onDismiss = { showExportPassword = false },
+                onConfirm = { password, _, _ ->
+                    showExportPassword = false
+                    backupBusy = true
+                    viewModel.exportBackup(password.toCharArray()) { backupBytes ->
+                      if (backupBytes != null && backupBytes.size <= BackupFileIO.MAX_BACKUP_BYTES) {
+                        try {
+                          pendingBackup = backupBytes
+                          viewModel.suppressNextBackgroundLock()
+                          saveBackupLauncher.launch("VaultLock_Backup_${System.currentTimeMillis()}.vault")
+                        } catch (_: Exception) {
+                          pendingBackup = null
+                          backupBytes.fill(0)
+                          backupBusy = false
+                          coroutineScope.launch { snackbarHostState.showSnackbar("Unable to open the save picker") }
+                        }
+                      } else {
+                          backupBusy = false
+                          val message = if (backupBytes != null) {
+                              backupBytes.fill(0)
+                              "Backup exceeds the supported 16 MiB size."
+                          } else viewModel.uiState.value.errorMessage ?: "Backup failed. Unlock the vault and try again."
+                          coroutineScope.launch { snackbarHostState.showSnackbar(message) }
+                      }
+                    }
+                })
+        }
+        pendingImport?.let { bytes ->
+            BackupPasswordDialog(export = false,
+                onDismiss = {
+                    bytes.fill(0)
+                    pendingImport = null
+                    backupBusy = false
+                },
+                onConfirm = { password, legacy, skipDuplicates ->
+                    pendingImport = null
+                    viewModel.importBackup(bytes, password.toCharArray(), legacy, skipDuplicates) { _, _, message ->
+                        backupBusy = false
+                        coroutineScope.launch { snackbarHostState.showSnackbar(message) }
+                    }
+                })
         }
 
         // Change Password Dialog
@@ -591,9 +621,10 @@ fun ChangeMasterPasswordDialog(
     var confirmPassword by remember { mutableStateOf("") }
     var showPasswords by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var changing by remember { mutableStateOf(false) }
 
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { if (!changing) onDismiss() },
         title = { Text("Change Master Password") },
         text = {
             Column {
@@ -657,7 +688,9 @@ fun ChangeMasterPasswordDialog(
         confirmButton = {
             Button(
                 onClick = {
+                    changing = true
                     onChange(currentPassword, newPassword, confirmPassword) { success, msg ->
+                        changing = false
                         if (success) {
                             onDismiss()
                         } else {
@@ -665,13 +698,14 @@ fun ChangeMasterPasswordDialog(
                         }
                     }
                 },
+                enabled = !changing,
                 colors = ButtonDefaults.buttonColors(containerColor = Amber500)
             ) {
                 Text("Update Password", color = Color(0xFF0F172A), fontWeight = FontWeight.Bold)
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(onClick = onDismiss, enabled = !changing) {
                 Text("Cancel")
             }
         }
@@ -764,5 +798,54 @@ fun ThemePickerDialog(
                 Text("Done")
             }
         }
+    )
+}
+
+@Composable
+private fun BackupPasswordDialog(
+    export: Boolean,
+    onDismiss: () -> Unit,
+    onConfirm: (String, Boolean, Boolean) -> Unit
+) {
+    var password by remember { mutableStateOf("") }
+    var confirmation by remember { mutableStateOf("") }
+    var legacy by remember { mutableStateOf(false) }
+    var skipDuplicates by remember { mutableStateOf(true) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (export) "Protect your backup" else "Restore backup") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(if (export) "Choose a separate password of at least 12 characters. Keep it safe: you need it to restore on any device."
+                     else "Entries will be added to this vault. Existing entries will not be overwritten.")
+                if (!export) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Switch(checked = legacy, onCheckedChange = { legacy = it })
+                        Text("Legacy file (original vault key required)")
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Switch(checked = skipDuplicates, onCheckedChange = { skipDuplicates = it })
+                        Text("Skip entries with identical content")
+                    }
+                }
+                if (!legacy) {
+                    OutlinedTextField(value = password, onValueChange = { password = it },
+                        label = { Text("Backup password") }, singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password))
+                    if (export) OutlinedTextField(value = confirmation, onValueChange = { confirmation = it },
+                        label = { Text("Confirm backup password") }, singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password))
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(enabled = if (export) password.length >= 12 && password == confirmation else legacy || password.isNotEmpty(),
+                onClick = { onConfirm(password, legacy, skipDuplicates); password = ""; confirmation = "" }) {
+                Text(if (export) "Create backup" else "Restore")
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
     )
 }
