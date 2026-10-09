@@ -284,8 +284,42 @@ class MasterPasswordRecoveryTest {
         runCurrent()
     }
 
+    @Test
+    fun `background lock during password derivation prevents delayed unlock`() = runTest(dispatcher) {
+        seedVault()
+        SessionManager.lock()
+        val model = VaultViewModel(application, preferences, dispatcher)
+        val result = CompletableDeferred<Boolean>()
+        model.unlockWithPassword(oldPassword) { ok, _ -> result.complete(ok) }
+        // Invalidate the request before its dispatcher resumes.
+        model.onAppBackgrounded()
+        runCurrent()
+        assertFalse(result.await())
+        assertFalse(SessionManager.hasKey())
+        assertFalse(model.uiState.value.isUnlocked)
+    }
+
+    @Test
+    fun `lock at rotation commit keeps vault locked and new password recoverable`() = runTest(dispatcher) {
+        val id = seedVault()
+        val finalCommit = faultPrefs.commits + 2
+        faultPrefs.beforeCommit = { if (faultPrefs.commits == finalCommit) SessionManager.lock() }
+        val model = VaultViewModel(application, preferences, dispatcher)
+        val result = CompletableDeferred<Boolean>()
+        model.changeMasterPassword(oldPassword, newPassword, newPassword) { ok, _ -> result.complete(ok) }
+        runCurrent()
+        assertTrue(result.await())
+        assertFalse(SessionManager.hasKey())
+        faultPrefs.beforeCommit = null
+        assertTrue(unlock(model, newPassword).first)
+        assertEquals("secret", repository.getEntryById(id)?.password)
+        model.lockVault()
+        runCurrent()
+    }
+
     /** Inject a rejected write without changing stored credentials. */
     private class FailingCommitPreferences(private val delegate: SharedPreferences) : SharedPreferences by delegate {
+        var beforeCommit: (() -> Unit)? = null
         var commits = 0
         var failCommitNumber = -1
 
@@ -310,6 +344,7 @@ class MasterPasswordRecoveryTest {
                 }
                 override fun commit(): Boolean {
                     commits++
+                    beforeCommit?.invoke()
                     return if (commits == failCommitNumber) false else editor.commit()
                 }
             }

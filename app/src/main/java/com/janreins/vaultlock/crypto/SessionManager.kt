@@ -18,7 +18,20 @@ object SessionManager {
     private val _isUnlocked = MutableStateFlow(false)
     val isUnlocked: StateFlow<Boolean> = _isUnlocked.asStateFlow()
 
+    // Changes on every lock/unlock, including a lock while authentication is still running.
+    @Volatile private var generation: Long = 0
+    fun generation(): Long = generation
+
+    @Synchronized
+    fun setKeyIfCurrent(key: SecretKey, expectedGeneration: Long): Boolean {
+        if (generation != expectedGeneration) return false
+        setKey(key)
+        return true
+    }
+
+    @Synchronized
     fun setKey(key: SecretKey) {
+        generation++
         _activeKey.value = key
         lastActiveTimestamp = System.currentTimeMillis()
         _isUnlocked.value = true
@@ -36,7 +49,9 @@ object SessionManager {
 
     fun getLastActivity(): Long = lastActiveTimestamp
 
+    @Synchronized
     fun lock() {
+        generation++
         val key = _activeKey.value
         _activeKey.value = null
         if (key != null) {

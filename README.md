@@ -44,21 +44,45 @@ VaultLock uses local encryption to protect credentials stored on-device:
 ./gradlew testDebugUnitTest lintDebug assembleDebug
 ```
 Android's default debug keystore is generated automatically; no repository keystore is needed.
-The Android CI workflow runs these checks, verifies that the APK has no network permissions,
-and uploads the debug APK as `app-debug-apk` plus reports. Pushing a `v*` tag creates a GitHub
-Release with the debug APK. Debug APKs are for testing and use a different signing
-key from a production installation; do not uninstall an existing vault to install one.
+The Android CI workflow runs unit tests and debug/release lint, builds both APK variants,
+checks both packaged manifests for network permissions, and uploads the debug APK and reports.
+Debug builds use `com.janreins.vaultlock.debug` and can coexist with production. Their generated
+signing key is not stable across CI runners; use synthetic data in debug builds.
 
-### Current recovery limitations
-Existing backup files are encrypted with the installation's master key and do not include its
-derivation salt. They restore only into the same vault using the original key. A fresh installation,
-app reset, or master-password change cannot recover those files. Restore currently appends entries,
-so importing a file repeatedly creates duplicates. Keep exports in local storage to avoid sending
-them through a document provider that syncs to the cloud.
+### Portable backups and recovery
+New exports use a separate backup password (minimum 12 characters). The v2 binary envelope
+contains a random 32-byte salt, PBKDF2-HMAC-SHA256 work factor (600,000 iterations), random
+12-byte IV, and AES-256-GCM ciphertext/tag. The complete header is authenticated. Imports
+reject unsupported versions, excessive work factors, files over 16 MiB, and malformed entries
+before the single batch insert. Restore encrypts entries with the destination vault's current key.
 
-The [review and repair plan](REVIEW.md) lists unresolved security and recovery issues.
-This revision is not ready to be the only store of important credentials until the release
-blockers there are fixed and Android/device checks pass.
+To recover after reinstalling or on another device: set up a destination vault with any master
+password, open Settings → Restore, select the export, and enter its **backup password**. Keep
+that password separately; there is no reset or recovery service. Exact duplicate contents are
+skipped by default; existing entries are never replaced. Creation/update dates are preserved.
+Choose a local document provider if you do not want a provider to sync the file to the cloud.
+
+Old v1 exports still require the original installation key. Select the explicit **Legacy file**
+option only for those files. A master-password change cannot make old exports portable:
+create a new v2 export while you can still unlock the original vault.
+
+Before any signing/app-ID transition, install an update signed by the **existing** key that can
+export v2, then verify recovery in a separate installation. Never uninstall a legacy vault just
+to resolve an APK signature mismatch. If its original signing key is unavailable, preserve that
+installation and recover credentials while it is accessible; this release cannot bypass Android
+signature checks or reconstruct missing legacy backup salts.
+
+### GitHub production releases
+A `v*` tag publishes a signed **release** APK plus its SHA-256 checksum only after CI succeeds.
+Configure repository Actions secrets using your existing production keystore:
+
+- `RELEASE_KEYSTORE_BASE64`: Base64-encoded keystore file.
+- `STORE_PASSWORD` and `KEY_PASSWORD`: keystore/key passwords.
+- `KEY_ALIAS`: signing alias (defaults to `upload`).
+
+Missing credentials fail the release job; it never substitutes a debug signature. Keep an offline
+copy of the production signing key and increment `versionCode` for every production update.
+Do not generate a replacement key for an existing production installation.
 
 ### Build Release APK
 ```bash

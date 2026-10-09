@@ -47,12 +47,13 @@ class SecurityPreferences(context: Context, customPrefs: SharedPreferences? = nu
                         is Float -> editor.putFloat(key, value)
                     }
                 }
-                editor.apply()
-                // Clear plain legacy preferences file for security
-                legacyPrefs.edit().clear().apply()
+                // Keep the only recoverable copy unless the encrypted write is durable.
+                check(editor.commit()) { "Could not migrate security preferences" }
+                legacyPrefs.edit().clear().commit()
             }
-        } catch (_: Exception) {
-            // Ignore migration failure and proceed
+        } catch (e: Exception) {
+            // Fail closed: do not present setup over a vault whose credentials failed migration.
+            throw IllegalStateException("Security migration failed; original credentials retained. Retry opening the app.", e)
         }
     }
 
