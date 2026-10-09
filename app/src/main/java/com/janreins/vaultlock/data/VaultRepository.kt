@@ -56,6 +56,7 @@ class VaultRepository(
             existing.toDomainStrict(key)
         }
         val entity = entry.toEntity(key)
+        check(SessionManager.activeKey.value === key) { "Vault locked before save." }
         if (entry.id == 0L) {
             vaultDao.insertEntry(entity)
         } else {
@@ -93,18 +94,27 @@ class VaultRepository(
             val entities = vaultDao.getAllEntriesSync()
             val updated = entities.map { it.toDomainStrict(oldKey).toEntity(newKey) }
             beforeWrite()
-            vaultDao.insertAll(updated)
-            // Credential promotion is inside the same gate as the row rewrite.
-            afterWrite()
+            try {
+                vaultDao.insertAll(updated)
+                // Credential promotion is inside the same gate as the row rewrite.
+                afterWrite()
+            } catch (failure: Throwable) {
+                // A cancelled Room continuation can hide a successful commit. Keep the journal
+                // and close the session BEFORE releasing the gate; no old-key writes may follow.
+                SessionManager.lock()
+                throw failure
+            }
         }
     }
 
     suspend fun createEncryptedBackupPayload(password: CharArray): ByteArray = mutate { key ->
         val entities = vaultDao.getAllEntriesSync()
+        require(entities.size <= 50_000) { "Too many backup entries." }
         val itemsArray = JSONArray()
 
         for (entity in entities) {
             val domain = entity.toDomainStrict(key)
+            validateBackupEntry(domain)
             val jsonItem = JSONObject().apply {
                 put("id", domain.id)
                 put("title", domain.title)
@@ -168,17 +178,23 @@ class VaultRepository(
                     category = field("category"), isFavorite = obj.getBoolean("isFavorite"),
                     createdAt = obj.getLong("createdAt"), updatedAt = obj.getLong("updatedAt")
                 )
-                require(entry.title.isNotBlank() && entry.createdAt >= 0 && entry.updatedAt >= 0) { "Invalid entry metadata." }
+                validateBackupEntry(entry)
                 if (!skipDuplicates || existing.add(entry.identity())) {
                     restored.add(entry.toEntity(key).copy(updatedAt = entry.updatedAt))
                 }
             }
+            check(SessionManager.activeKey.value === key) { "Vault locked before import." }
             vaultDao.insertAll(restored)
             restored.size
         } finally {
             decryptedBytes.fill(0)
             password.fill('\u0000')
         }
+    }
+
+    private fun validateBackupEntry(entry: VaultEntry) {
+        require(entry.title.isNotBlank() && entry.createdAt >= 0 && entry.updatedAt >= 0) { "Invalid entry metadata." }
+        require(entry.identity().all { it.length <= 1_000_000 }) { "Entry field exceeds backup limit." }
     }
 
     // Compare exact content, excluding local IDs/timestamps/favorite state. Never replace existing entries.

@@ -246,6 +246,7 @@ class VaultViewModel @JvmOverloads constructor(
         viewModelScope.launch {
             try {
                 val derivedKey = withContext(kdfDispatcher) { securityPreferences.setupMasterPassword(password.toCharArray()) }
+                _uiState.update { it.copy(isMasterPasswordSet = true) }
                 check(SessionManager.setKeyIfCurrent(derivedKey, sessionGeneration)) { "Setup completed. Unlock to continue." }
                 _uiState.update {
                     it.copy(
