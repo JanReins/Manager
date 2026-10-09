@@ -45,7 +45,6 @@ android {
     debug {
       applicationIdSuffix = ".debug"
       versionNameSuffix = "-debug"
-      resValue("string", "app_name", "VaultLock Debug")
     }
     // Debug builds coexist with the production vault; never uninstall production to test.
   }
@@ -56,7 +55,6 @@ android {
   buildFeatures {
     compose = true
     buildConfig = true
-    resValues = true
   }
   testOptions { unitTests { isIncludeAndroidResources = true } }
   dependenciesInfo {

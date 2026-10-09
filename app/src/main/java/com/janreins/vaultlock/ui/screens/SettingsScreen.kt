@@ -437,27 +437,27 @@ fun SettingsScreen(
                 onConfirm = { password, _, _ ->
                     showExportPassword = false
                     backupBusy = true
-                              viewModel.exportBackup(password.toCharArray()) { backupBytes ->
-                                if (backupBytes != null && backupBytes.size <= BackupFileIO.MAX_BACKUP_BYTES) {
-                                  try {
-                                    pendingBackup = backupBytes
-                                    viewModel.suppressNextBackgroundLock()
-                                    saveBackupLauncher.launch("VaultLock_Backup_${System.currentTimeMillis()}.vault")
-                                  } catch (_: Exception) {
-                                    pendingBackup = null
-                                    backupBytes.fill(0)
-                                    backupBusy = false
-                                    coroutineScope.launch { snackbarHostState.showSnackbar("Unable to open the save picker") }
-                                  }
-                                } else {
-                                    backupBusy = false
-                                    val message = if (backupBytes != null) {
-                                        backupBytes.fill(0)
-                                        "Backup exceeds the supported 16 MiB size."
-                                    } else viewModel.uiState.value.errorMessage ?: "Backup failed. Unlock the vault and try again."
-                                    coroutineScope.launch { snackbarHostState.showSnackbar(message) }
-                                }
-                              }
+                    viewModel.exportBackup(password.toCharArray()) { backupBytes ->
+                      if (backupBytes != null && backupBytes.size <= BackupFileIO.MAX_BACKUP_BYTES) {
+                        try {
+                          pendingBackup = backupBytes
+                          viewModel.suppressNextBackgroundLock()
+                          saveBackupLauncher.launch("VaultLock_Backup_${System.currentTimeMillis()}.vault")
+                        } catch (_: Exception) {
+                          pendingBackup = null
+                          backupBytes.fill(0)
+                          backupBusy = false
+                          coroutineScope.launch { snackbarHostState.showSnackbar("Unable to open the save picker") }
+                        }
+                      } else {
+                          backupBusy = false
+                          val message = if (backupBytes != null) {
+                              backupBytes.fill(0)
+                              "Backup exceeds the supported 16 MiB size."
+                          } else viewModel.uiState.value.errorMessage ?: "Backup failed. Unlock the vault and try again."
+                          coroutineScope.launch { snackbarHostState.showSnackbar(message) }
+                      }
+                    }
                 })
         }
         pendingImport?.let { bytes ->
