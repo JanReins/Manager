@@ -1,8 +1,5 @@
 package com.janreins.vaultlock.ui.screens
 
-import android.net.Uri
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.fragment.app.FragmentActivity
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -55,7 +52,6 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -73,7 +69,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
-import com.janreins.vaultlock.ui.BackupFileIO
 import com.janreins.vaultlock.ui.VaultUiState
 import com.janreins.vaultlock.ui.VaultViewModel
 import com.janreins.vaultlock.ui.theme.Amber400
@@ -81,9 +76,6 @@ import com.janreins.vaultlock.ui.theme.Amber500
 import com.janreins.vaultlock.ui.theme.EmeraldSuccess
 import com.janreins.vaultlock.ui.theme.RedError
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -91,7 +83,8 @@ fun SettingsScreen(
     viewModel: VaultViewModel,
     uiState: VaultUiState,
     onNavigateBack: () -> Unit,
-    onWipeApp: () -> Unit
+    onWipeApp: () -> Unit,
+    onRestoreBackup: () -> Unit
 ) {
     val context = LocalContext.current
     val activity = context as? FragmentActivity
@@ -102,67 +95,7 @@ fun SettingsScreen(
     var showAutoLockDialog by remember { mutableStateOf(false) }
     var showThemeDialog by remember { mutableStateOf(false) }
     var showWipeConfirmationDialog by remember { mutableStateOf(false) }
-    var pendingBackup by remember { mutableStateOf<ByteArray?>(null) }
-    var backupBusy by remember { mutableStateOf(false) }
     var showExportPassword by remember { mutableStateOf(false) }
-    var pendingImport by remember { mutableStateOf<ByteArray?>(null) }
-    DisposableEffect(Unit) {
-        onDispose {
-            pendingBackup?.fill(0)
-            pendingImport?.fill(0)
-        }
-    }
-
-    val saveBackupLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.CreateDocument("application/octet-stream")
-    ) { uri ->
-        val bytes = pendingBackup
-        pendingBackup = null
-        coroutineScope.launch {
-            try {
-                if (uri != null && bytes != null) {
-                    withContext(Dispatchers.IO) {
-                        checkNotNull(context.contentResolver.openOutputStream(uri, "wt")) {
-                            "Cannot open the backup destination."
-                        }.use { it.write(bytes) }
-                    }
-                    snackbarHostState.showSnackbar("Encrypted backup saved")
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                snackbarHostState.showSnackbar("Backup could not be saved. Try another destination.")
-            } finally {
-                bytes?.fill(0)
-                backupBusy = false
-            }
-        }
-    }
-
-    // File Picker for importing encrypted backup
-    val restoreBackupLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri: Uri? ->
-        if (uri != null) {
-            coroutineScope.launch {
-                try {
-                    val bytes = withContext(Dispatchers.IO) {
-                        checkNotNull(context.contentResolver.openInputStream(uri)) {
-                            "Cannot open the selected backup."
-                        }.use { BackupFileIO.readBounded(it) }
-                    }
-                    pendingImport = bytes
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    backupBusy = false
-                    snackbarHostState.showSnackbar(e.message ?: "Failed to read backup file")
-                }
-            }
-        } else {
-            backupBusy = false
-        }
-    }
 
     Scaffold(
         topBar = {
@@ -349,7 +282,7 @@ fun SettingsScreen(
                         title = "Export Encrypted Backup",
                         subtitle = "Creates an offline AES-256-GCM encrypted file",
                         onClick = {
-                            if (!backupBusy) showExportPassword = true
+                            if (!uiState.isBackupBusy) showExportPassword = true
                         },
                         testTag = "setting_export_backup"
                     )
@@ -360,16 +293,7 @@ fun SettingsScreen(
                         title = "Restore Encrypted Backup",
                         subtitle = "Restore with a backup password; skip exact duplicates",
                         onClick = {
-                          if (!backupBusy) {
-                            backupBusy = true
-                            try {
-                            viewModel.suppressNextBackgroundLock()
-                            restoreBackupLauncher.launch("*/*")
-                            } catch (_: Exception) {
-                                backupBusy = false
-                                coroutineScope.launch { snackbarHostState.showSnackbar("Unable to open the restore picker") }
-                            }
-                          }
+                            if (!uiState.isBackupBusy) onRestoreBackup()
                         },
                         testTag = "setting_restore_backup"
                     )
@@ -436,43 +360,7 @@ fun SettingsScreen(
                 onDismiss = { showExportPassword = false },
                 onConfirm = { password, _, _ ->
                     showExportPassword = false
-                    backupBusy = true
-                    viewModel.exportBackup(password.toCharArray()) { backupBytes ->
-                      if (backupBytes != null && backupBytes.size <= BackupFileIO.MAX_BACKUP_BYTES) {
-                        try {
-                          pendingBackup = backupBytes
-                          viewModel.suppressNextBackgroundLock()
-                          saveBackupLauncher.launch("VaultLock_Backup_${System.currentTimeMillis()}.vault")
-                        } catch (_: Exception) {
-                          pendingBackup = null
-                          backupBytes.fill(0)
-                          backupBusy = false
-                          coroutineScope.launch { snackbarHostState.showSnackbar("Unable to open the save picker") }
-                        }
-                      } else {
-                          backupBusy = false
-                          val message = if (backupBytes != null) {
-                              backupBytes.fill(0)
-                              "Backup exceeds the supported 16 MiB size."
-                          } else viewModel.uiState.value.errorMessage ?: "Backup failed. Unlock the vault and try again."
-                          coroutineScope.launch { snackbarHostState.showSnackbar(message) }
-                      }
-                    }
-                })
-        }
-        pendingImport?.let { bytes ->
-            BackupPasswordDialog(export = false,
-                onDismiss = {
-                    bytes.fill(0)
-                    pendingImport = null
-                    backupBusy = false
-                },
-                onConfirm = { password, legacy, skipDuplicates ->
-                    pendingImport = null
-                    viewModel.importBackup(bytes, password.toCharArray(), legacy, skipDuplicates) { _, _, message ->
-                        backupBusy = false
-                        coroutineScope.launch { snackbarHostState.showSnackbar(message) }
-                    }
+                    viewModel.exportBackup(password.toCharArray())
                 })
         }
 
@@ -802,7 +690,7 @@ fun ThemePickerDialog(
 }
 
 @Composable
-private fun BackupPasswordDialog(
+internal fun BackupPasswordDialog(
     export: Boolean,
     onDismiss: () -> Unit,
     onConfirm: (String, Boolean, Boolean) -> Unit
