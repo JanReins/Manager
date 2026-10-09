@@ -42,8 +42,14 @@ jobs:
       - name: Install Android build tools
         run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
 
-      - name: Run unit tests, lint, and build both variants
-        run: ./gradlew testDebugUnitTest lintDebug lintRelease assembleDebug assembleRelease --stacktrace
+      - name: Run unit tests
+        run: ./gradlew testDebugUnitTest --stacktrace
+
+      - name: Lint both variants
+        run: ./gradlew lintDebug lintRelease --stacktrace
+
+      - name: Build both APK variants
+        run: ./gradlew assembleDebug assembleRelease --stacktrace
 
       - name: Check APK stays offline
         shell: bash

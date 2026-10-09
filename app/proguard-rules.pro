@@ -24,3 +24,12 @@
 # Preserve Vault Entities & Security Preference Data Models
 -keep class com.janreins.vaultlock.data.** { *; }
 -keep class com.janreins.vaultlock.crypto.** { *; }
+
+# Tink references these optional static-analysis annotations. They contain no
+# runtime cryptography; suppress only the exact missing annotation types reported by R8.
+-dontwarn com.google.errorprone.annotations.CanIgnoreReturnValue
+-dontwarn com.google.errorprone.annotations.CheckReturnValue
+-dontwarn com.google.errorprone.annotations.Immutable
+-dontwarn com.google.errorprone.annotations.RestrictedApi
+-dontwarn javax.annotation.Nullable
+-dontwarn javax.annotation.concurrent.GuardedBy
