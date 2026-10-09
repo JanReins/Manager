@@ -63,6 +63,17 @@ class LockLifecycleTest {
         store = ViewModelStore().apply { put("vault", viewModel) }
     }
 
+    /** Ends each test with the ViewModel cleared so no auto-lock/expiry loop keeps the test scheduler busy. */
+    private fun vmTest(body: suspend TestScope.() -> Unit) = runTest {
+        try {
+            body()
+        } finally {
+            store.clear()
+            SessionManager.lock()
+            runCurrent()
+        }
+    }
+
     @After
     fun tearDown() {
         store.clear()
@@ -71,7 +82,7 @@ class LockLifecycleTest {
     }
 
     @Test
-    fun `normal stop always locks for timeout 120`() = runTest {
+    fun `normal stop always locks for timeout 120`() = vmTest {
         runCurrent()
         viewModel.setAutoLockDuration(120)
         viewModel.onActivityStopped(false)
@@ -80,7 +91,7 @@ class LockLifecycleTest {
     }
 
     @Test
-    fun `normal stop always locks for timeout 0`() = runTest {
+    fun `normal stop always locks for timeout 0`() = vmTest {
         runCurrent()
         viewModel.setAutoLockDuration(0)
         viewModel.onActivityStopped(false)
@@ -89,7 +100,7 @@ class LockLifecycleTest {
     }
 
     @Test
-    fun `stop during an open export picker locks and completion writes ciphertext while locked`() = runTest {
+    fun `stop during an open export picker locks and completion writes ciphertext while locked`() = vmTest {
         runCurrent()
         viewModel.exportBackup("BackupPassword123!".toCharArray())
         awaitState { viewModel.uiState.value.exportReadyFileName != null }
@@ -121,7 +132,7 @@ class LockLifecycleTest {
     }
 
     @Test
-    fun `rotate then foreground then Home locks normally`() = runTest {
+    fun `rotate then foreground then Home locks normally`() = vmTest {
         runCurrent()
         viewModel.onActivityStopped(true)
         runCurrent()
@@ -134,7 +145,7 @@ class LockLifecycleTest {
     }
 
     @Test
-    fun `configuration change without foreground locks at five seconds`() = runTest {
+    fun `configuration change without foreground locks at five seconds`() = vmTest {
         runCurrent()
         viewModel.onActivityStopped(true)
         runCurrent()
@@ -147,7 +158,7 @@ class LockLifecycleTest {
     }
 
     @Test
-    fun `foreground cancels configuration guard`() = runTest {
+    fun `foreground cancels configuration guard`() = vmTest {
         runCurrent()
         viewModel.onActivityStopped(true)
         runCurrent()
@@ -158,7 +169,7 @@ class LockLifecycleTest {
     }
 
     @Test
-    fun `draft survives recreation and all drafts clear on lock`() = runTest {
+    fun `draft survives recreation and all drafts clear on lock`() = vmTest {
         runCurrent()
         val draft = viewModel.entryDraft("back-stack-id")
         draft.title = "Edited title"
@@ -196,7 +207,7 @@ class LockLifecycleTest {
     }
 
     @Test
-    fun `explicit draft discard removes and clears only that draft`() = runTest {
+    fun `explicit draft discard removes and clears only that draft`() = vmTest {
         runCurrent()
         val discarded = viewModel.entryDraft("discard").apply { password = "secret" }
         val retained = viewModel.entryDraft("keep").apply { title = "keep" }
@@ -207,7 +218,7 @@ class LockLifecycleTest {
     }
 
     @Test
-    fun `session lock collector clears editor drafts`() = runTest {
+    fun `session lock collector clears editor drafts`() = vmTest {
         runCurrent()
         val draft = viewModel.entryDraft("editor").apply { password = "secret" }
         SessionManager.lock()

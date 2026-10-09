@@ -87,6 +87,17 @@ class BackupPickerFlowTest {
         store = ViewModelStore().apply { put("vault", viewModel) }
     }
 
+    /** Ends each test with the ViewModel cleared so no auto-lock/expiry loop keeps the test scheduler busy. */
+    private fun vmTest(body: suspend TestScope.() -> Unit) = runTest {
+        try {
+            body()
+        } finally {
+            store.clear()
+            SessionManager.lock()
+            runCurrent()
+        }
+    }
+
     @After
     fun tearDown() {
         store.clear()
@@ -116,7 +127,7 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `export prepared in VM survives lock and writes exact ciphertext then zeroes`() = runTest {
+    fun `export prepared in VM survives lock and writes exact ciphertext then zeroes`() = vmTest {
         runCurrent()
         val password = "SeparateBackupPassword!".toCharArray()
         viewModel.exportBackup(password)
@@ -142,7 +153,7 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `export cancellation zeroes pending bytes and clears busy state`() = runTest {
+    fun `export cancellation zeroes pending bytes and clears busy state`() = vmTest {
         runCurrent()
         val bytes = byteArrayOf(1, 2, 3, 4)
         seedExport(bytes)
@@ -156,7 +167,7 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `missing export data deletes empty document and reports lost data`() = runTest {
+    fun `missing export data deletes empty document and reports lost data`() = vmTest {
         runCurrent()
         viewModel.lockVault()
         viewModel.completeExport(uri)
@@ -168,7 +179,7 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `write failure deletes document reports error and zeroes bytes`() = runTest {
+    fun `write failure deletes document reports error and zeroes bytes`() = vmTest {
         runCurrent()
         val bytes = byteArrayOf(1, 2, 3, 4)
         seedExport(bytes)
@@ -181,7 +192,7 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `missing export data reports empty file when deletion returns false or throws`() = runTest {
+    fun `missing export data reports empty file when deletion returns false or throws`() = vmTest {
         runCurrent()
         viewModel.lockVault()
         for (throws in listOf(false, true)) {
@@ -199,7 +210,7 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `write failure reports possible empty file when deletion returns false or throws`() = runTest {
+    fun `write failure reports possible empty file when deletion returns false or throws`() = vmTest {
         runCurrent()
         documents.failWrite = true
         for (throws in listOf(false, true)) {
@@ -220,7 +231,7 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `unlaunched export is discarded by explicit and observed session locks`() = runTest {
+    fun `unlaunched export is discarded by explicit and observed session locks`() = vmTest {
         runCurrent()
         for (externalLock in listOf(false, true)) {
             SessionManager.setKey(SecretKeySpec(ByteArray(32) { 1 }, "AES"))
@@ -243,7 +254,7 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `picker launch failure clears busy state and export bytes`() = runTest {
+    fun `picker launch failure clears busy state and export bytes`() = vmTest {
         runCurrent()
         val bytes = byteArrayOf(1, 2, 3, 4)
         seedExport(bytes)
@@ -256,7 +267,7 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `import result can finish reading after a background lock`() = runTest {
+    fun `import result can finish reading after a background lock`() = vmTest {
         runCurrent()
         assertTrue(viewModel.beginImportPicker())
         viewModel.onImportFilePicked(uri)
@@ -267,7 +278,7 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `null import result clears busy state`() = runTest {
+    fun `null import result clears busy state`() = vmTest {
         runCurrent()
         viewModel.beginImportPicker()
         viewModel.onImportFilePicked(null)
@@ -278,7 +289,7 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `import picked while locked holds only encrypted data waits for unlock and discard zeroes`() = runTest {
+    fun `import picked while locked holds only encrypted data waits for unlock and discard zeroes`() = vmTest {
         runCurrent()
         val dao = VaultDatabase.getInstance(application).vaultDao()
         val countBefore = withContext(Dispatchers.IO) { dao.getCount() }
@@ -308,7 +319,7 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `bounded import read failure reports validation error and clears busy`() = runTest {
+    fun `bounded import read failure reports validation error and clears busy`() = vmTest {
         runCurrent()
         documents.input = byteArrayOf(1, 2, 3)
         viewModel.onImportFilePicked(uri)
@@ -319,7 +330,7 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `pending import expires at ten minutes while locked and zeroes ciphertext`() = runTest {
+    fun `pending import expires at ten minutes while locked and zeroes ciphertext`() = vmTest {
         runCurrent()
         viewModel.lockVault()
         viewModel.onImportFilePicked(uri)
@@ -342,7 +353,7 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `confirmation checks monotonic expiry even before the expiry job runs`() = runTest {
+    fun `confirmation checks monotonic expiry even before the expiry job runs`() = vmTest {
         runCurrent()
         viewModel.onImportFilePicked(uri)
         awaitState { viewModel.uiState.value.hasPendingImport }
@@ -366,7 +377,7 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `replacement zeroes old import and starts a fresh expiry timer`() = runTest {
+    fun `replacement zeroes old import and starts a fresh expiry timer`() = vmTest {
         runCurrent()
         viewModel.lockVault()
         viewModel.onImportFilePicked(uri)
@@ -392,7 +403,7 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `discard cancels pending import expiry`() = runTest {
+    fun `discard cancels pending import expiry`() = vmTest {
         runCurrent()
         viewModel.onImportFilePicked(uri)
         awaitState { viewModel.uiState.value.hasPendingImport }
@@ -407,7 +418,7 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `confirmation after unlock uses pending import and clears it on restore failure`() = runTest {
+    fun `confirmation after unlock uses pending import and clears it on restore failure`() = vmTest {
         runCurrent()
         viewModel.lockVault()
         viewModel.onImportFilePicked(uri)
@@ -430,7 +441,7 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `wipe clears pending buffers and editor drafts`() = runTest {
+    fun `wipe clears pending buffers and editor drafts`() = vmTest {
         runCurrent()
         val exported = byteArrayOf(1, 2, 3, 4)
         seedExport(exported)
@@ -455,7 +466,7 @@ class BackupPickerFlowTest {
     }
 
     @Test
-    fun `onCleared zeroes both pending buffers`() = runTest {
+    fun `onCleared zeroes both pending buffers`() = vmTest {
         runCurrent()
         val exported = byteArrayOf(1, 2, 3, 4)
         seedExport(exported)
