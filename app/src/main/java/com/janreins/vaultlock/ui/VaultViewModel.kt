@@ -5,10 +5,12 @@ import android.content.ClipData
 import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.PersistableBundle
+import android.os.SystemClock
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -23,6 +25,7 @@ import com.janreins.vaultlock.data.VaultRepository
 import com.janreins.vaultlock.generator.GeneratorOptions
 import com.janreins.vaultlock.generator.PasswordGenerator
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -38,6 +41,9 @@ import javax.crypto.SecretKey
 
 data class VaultUiState(
     val isSaving: Boolean = false,
+    val isBackupBusy: Boolean = false,
+    val exportReadyFileName: String? = null,
+    val hasPendingImport: Boolean = false,
     val isMasterPasswordSet: Boolean = false,
     val isUnlocked: Boolean = false,
     val isBiometricAvailable: Boolean = false,
@@ -61,7 +67,10 @@ class VaultViewModel @JvmOverloads constructor(
     application: Application,
     customSecurityPreferences: SecurityPreferences? = null,
     /** Dispatcher for CPU-heavy PBKDF2 key derivation; injectable for tests. */
-    private val kdfDispatcher: CoroutineDispatcher = Dispatchers.Default
+    private val kdfDispatcher: CoroutineDispatcher = Dispatchers.Default,
+    private val elapsedRealtime: () -> Long = { SystemClock.elapsedRealtime() },
+    private val backupDocumentStore: BackupDocumentStore =
+        ContentResolverBackupDocumentStore(application.contentResolver)
 ) : AndroidViewModel(application) {
 
     private val securityPreferences = customSecurityPreferences ?: SecurityPreferences(application)
@@ -81,6 +90,18 @@ class VaultViewModel @JvmOverloads constructor(
     )
     val uiState: StateFlow<VaultUiState> = _uiState.asStateFlow()
 
+    companion object {
+        const val CONFIG_CHANGE_GRACE_MS = 5_000L
+        const val PENDING_IMPORT_TTL_MS = 600_000L
+    }
+
+    private val entryDrafts = mutableMapOf<String, EntryDraft>()
+    private var pendingExport: ByteArray? = null
+    private var pendingImport: ByteArray? = null
+    private var pendingImportSetAt: Long? = null
+    private var pendingImportExpiryJob: Job? = null
+    private var backupGeneration = 0L
+    private var configChangeGuardJob: Job? = null
     private var autoLockJob: Job? = null
     private var lockoutCountdownJob: Job? = null
     private val clipboardClearHandler = Handler(Looper.getMainLooper())
@@ -98,6 +119,10 @@ class VaultViewModel @JvmOverloads constructor(
         // Observe SessionManager unlock state
         viewModelScope.launch {
             SessionManager.isUnlocked.collect { unlocked ->
+                if (!unlocked) {
+                    clearEntryDrafts()
+                    discardUnlaunchedExport()
+                }
                 _uiState.update { if (unlocked) it.copy(isUnlocked = true) else it.clearedForLock() }
                 if (unlocked) {
                     startInactivityTimer()
@@ -194,26 +219,26 @@ class VaultViewModel @JvmOverloads constructor(
         }
     }
 
-    private var ignoreNextBackgroundLock = false
-
-    fun suppressNextBackgroundLock() {
-        ignoreNextBackgroundLock = true
+    fun onActivityStopped(isChangingConfigurations: Boolean) {
+        configChangeGuardJob?.cancel()
+        if (isChangingConfigurations) {
+            configChangeGuardJob = viewModelScope.launch {
+                delay(CONFIG_CHANGE_GRACE_MS)
+                lockVault(clearClipboard = false)
+            }
+        } else {
+            onAppBackgrounded()
+        }
     }
 
-    /**
-     * Locks the vault immediately when the application is sent to the background,
-     * unless temporarily suppressed by system file picker or share sheet activities.
-     */
     fun onAppBackgrounded() {
-        if (ignoreNextBackgroundLock) {
-            ignoreNextBackgroundLock = false
-            return
-        }
+        configChangeGuardJob?.cancel()
         lockVault(clearClipboard = false)
     }
 
     fun onAppForegrounded() {
-        ignoreNextBackgroundLock = false
+        configChangeGuardJob?.cancel()
+        configChangeGuardJob = null
         if (_uiState.value.isUnlocked) {
             val timeoutMillis = _uiState.value.autoLockSeconds * 1000L
             if (timeoutMillis > 0) {
@@ -422,18 +447,34 @@ class VaultViewModel @JvmOverloads constructor(
         // Backgrounding must not wipe a just-copied secret before the user can paste it elsewhere;
         // the 30-second timer still clears it in that case.
         if (clearClipboard) clearOwnedClipboard()
+        configChangeGuardJob?.cancel()
         SessionManager.lock()
+        clearEntryDrafts()
+        discardUnlaunchedExport()
         _uiState.update { it.clearedForLock() }
     }
 
-    private fun VaultUiState.clearedForLock() = copy(
-        isUnlocked = false,
-        allEntries = emptyList(),
-        filteredEntries = emptyList(),
-        searchQuery = "",
-        currentGeneratedPassword = "",
-        activeCopiedLabel = null
-    )
+    fun entryDraft(key: String): EntryDraft = entryDrafts.getOrPut(key) { EntryDraft() }
+
+    fun discardEntryDraft(key: String) {
+        entryDrafts.remove(key)?.clear()
+    }
+
+    private fun clearEntryDrafts() {
+        entryDrafts.values.forEach { it.clear() }
+        entryDrafts.clear()
+    }
+
+    private fun VaultUiState.clearedForLock(): VaultUiState {
+        return copy(
+            isUnlocked = false,
+            allEntries = emptyList(),
+            filteredEntries = emptyList(),
+            searchQuery = "",
+            currentGeneratedPassword = "",
+            activeCopiedLabel = null
+        )
+    }
 
     fun consumeUserMessage() {
         _uiState.update { it.copy(userMessage = null) }
@@ -704,6 +745,8 @@ class VaultViewModel @JvmOverloads constructor(
     }
 
     override fun onCleared() {
+        clearPendingBackups()
+        clearEntryDrafts()
         clearOwnedClipboard()
         super.onCleared()
     }
@@ -737,25 +780,223 @@ class VaultViewModel @JvmOverloads constructor(
         }
     }
 
-    fun exportBackup(password: CharArray, onReady: (ByteArray?) -> Unit) {
-        _uiState.update { it.copy(errorMessage = null) }
-        viewModelScope.launch {
+    fun exportBackup(password: CharArray) {
+        val sessionGeneration = SessionManager.generation()
+        if (_uiState.value.isBackupBusy || !SessionManager.hasKey()) {
+            password.fill('\u0000')
+            return
+        }
+        val generation = backupGeneration
+        _uiState.update { it.copy(isBackupBusy = true) }
+        viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
             try {
                 val payload = repository.createEncryptedBackupPayload(password)
-                onReady(payload)
+                if (generation != backupGeneration) {
+                    payload.fill(0)
+                    return@launch
+                }
+                if (sessionGeneration != SessionManager.generation() || !SessionManager.hasKey()) {
+                    payload.fill(0)
+                    _uiState.update {
+                        it.copy(
+                            isBackupBusy = false,
+                            userMessage = "Vault locked before the backup was ready. Unlock and export again."
+                        )
+                    }
+                    return@launch
+                }
+                if (payload.size > BackupFileIO.MAX_BACKUP_BYTES) {
+                    payload.fill(0)
+                    _uiState.update {
+                        it.copy(isBackupBusy = false, userMessage = "Backup exceeds the supported 16 MiB size.")
+                    }
+                } else {
+                    pendingExport = payload
+                    _uiState.update {
+                        it.copy(exportReadyFileName = "VaultLock_Backup_${System.currentTimeMillis()}.vault")
+                    }
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                _uiState.update { it.copy(errorMessage = "Backup failed: ${e.localizedMessage}") }
-                onReady(null)
+                if (generation == backupGeneration) _uiState.update {
+                    it.copy(isBackupBusy = false, userMessage = "Backup failed: ${e.localizedMessage}")
+                }
             } finally {
                 password.fill('\u0000')
             }
         }
     }
 
+    fun consumeExportReadyFileName() {
+        _uiState.update { it.copy(exportReadyFileName = null) }
+    }
+
+    private fun discardUnlaunchedExport() {
+        // A consumed filename means the picker is already open and may still save ciphertext.
+        if (_uiState.value.exportReadyFileName == null || pendingExport == null) return
+        pendingExport?.fill(0)
+        pendingExport = null
+        _uiState.update { it.copy(exportReadyFileName = null, isBackupBusy = false) }
+    }
+
+    fun beginImportPicker(): Boolean {
+        if (_uiState.value.isBackupBusy) return false
+        _uiState.update { it.copy(isBackupBusy = true) }
+        return true
+    }
+
+    fun onBackupPickerLaunchFailed(export: Boolean) {
+        if (export) {
+            pendingExport?.fill(0)
+            pendingExport = null
+        }
+        _uiState.update {
+            it.copy(
+                isBackupBusy = false,
+                exportReadyFileName = null,
+                userMessage = if (export) "Unable to open the save picker" else "Unable to open the restore picker"
+            )
+        }
+    }
+
+    fun completeExport(uri: Uri?) {
+        consumeExportReadyFileName()
+        val bytes = pendingExport
+        pendingExport = null
+        if (uri == null) {
+            bytes?.fill(0)
+            _uiState.update { it.copy(isBackupBusy = false) }
+            return
+        }
+        val generation = backupGeneration
+        _uiState.update { it.copy(isBackupBusy = true) }
+        viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                val message = withContext(Dispatchers.IO) {
+                    if (bytes == null) {
+                        if (deleteBackupDocument(uri)) {
+                            "Backup was not saved: the encrypted data was lost. Unlock and export again."
+                        } else {
+                            "Backup was not saved: the encrypted data was lost. An empty file was left in the chosen folder; delete it, then unlock and export again."
+                        }
+                    } else {
+                        try {
+                            backupDocumentStore.write(uri, bytes)
+                            "Encrypted backup saved"
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            if (deleteBackupDocument(uri)) {
+                                "Backup could not be saved. Try another destination."
+                            } else {
+                                "Backup could not be saved. An empty file may have been left in the chosen folder. Try another destination."
+                            }
+                        }
+                    }
+                }
+                if (generation == backupGeneration) _uiState.update { it.copy(userMessage = message) }
+            } finally {
+                bytes?.fill(0)
+                if (generation == backupGeneration) _uiState.update { it.copy(isBackupBusy = false) }
+            }
+        }
+    }
+
+    private fun deleteBackupDocument(uri: Uri): Boolean =
+        try { backupDocumentStore.delete(uri) } catch (_: Exception) { false }
+
+    fun onImportFilePicked(uri: Uri?) {
+        if (uri == null) {
+            discardPendingImport()
+            return
+        }
+        val generation = backupGeneration
+        _uiState.update { it.copy(isBackupBusy = true) }
+        viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            var readBytes: ByteArray? = null
+            try {
+                // Read encrypted bytes only. Decryption requires explicit confirmation after unlock.
+                val bytes = withContext(Dispatchers.IO) {
+                    backupDocumentStore.read(uri).also { readBytes = it }
+                }
+                if (generation != backupGeneration) return@launch
+                cancelPendingImportExpiry()
+                pendingImport?.fill(0)
+                pendingImport = bytes
+                pendingImportSetAt = elapsedRealtime()
+                pendingImportExpiryJob = viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                    delay(PENDING_IMPORT_TTL_MS)
+                    expirePendingImport()
+                }
+                readBytes = null // Ownership transferred to the pending import.
+                _uiState.update { it.copy(hasPendingImport = true) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (generation == backupGeneration) {
+                    discardPendingImport()
+                    _uiState.update { it.copy(userMessage = e.message ?: "Failed to read backup file") }
+                }
+            } finally {
+                readBytes?.fill(0)
+            }
+        }
+    }
+
+    fun confirmPendingImport(password: CharArray, legacy: Boolean, skipDuplicates: Boolean) {
+        val selectedAt = pendingImportSetAt
+        if (selectedAt != null && elapsedRealtime() - selectedAt >= PENDING_IMPORT_TTL_MS) {
+            password.fill('\u0000')
+            expirePendingImport()
+            return
+        }
+        val bytes = pendingImport
+        if (!SessionManager.hasKey() || bytes == null) {
+            password.fill('\u0000')
+            return
+        }
+        val generation = backupGeneration
+        cancelPendingImportExpiry()
+        pendingImport = null
+        _uiState.update { it.copy(hasPendingImport = false) }
+        importBackup(bytes, password, legacy, skipDuplicates) { _, _, message ->
+            if (generation == backupGeneration) _uiState.update {
+                it.copy(isBackupBusy = false, userMessage = message)
+            }
+        }
+    }
+
+    fun discardPendingImport() {
+        cancelPendingImportExpiry()
+        pendingImport?.fill(0)
+        pendingImport = null
+        _uiState.update { it.copy(hasPendingImport = false, isBackupBusy = false) }
+    }
+
+    private fun cancelPendingImportExpiry() {
+        pendingImportExpiryJob?.cancel()
+        pendingImportExpiryJob = null
+        pendingImportSetAt = null
+    }
+
+    private fun expirePendingImport() {
+        discardPendingImport()
+        _uiState.update {
+            it.copy(userMessage = "The selected backup expired. Pick it again to restore.")
+        }
+    }
+
+    private fun clearPendingBackups() {
+        backupGeneration++
+        pendingExport?.fill(0)
+        pendingExport = null
+        discardPendingImport()
+        _uiState.update { it.copy(exportReadyFileName = null) }
+    }
+
     fun importBackup(encryptedBytes: ByteArray, password: CharArray, legacy: Boolean = false, skipDuplicates: Boolean = true, onComplete: (Boolean, Int, String) -> Unit) {
-        viewModelScope.launch {
+        viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
             try {
                 val restoredCount = repository.restoreEncryptedBackupPayload(encryptedBytes, password, legacy, skipDuplicates)
                 onComplete(true, restoredCount, "Successfully restored $restoredCount entries")
@@ -771,6 +1012,8 @@ class VaultViewModel @JvmOverloads constructor(
     }
 
     fun wipeAllData(onComplete: () -> Unit) {
+        clearPendingBackups()
+        clearEntryDrafts()
         viewModelScope.launch {
             try {
                 repository.wipeEverything()

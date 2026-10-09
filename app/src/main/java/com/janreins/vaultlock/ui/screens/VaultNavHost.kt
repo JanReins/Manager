@@ -1,8 +1,10 @@
 package com.janreins.vaultlock.ui.screens
 
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import android.widget.Toast
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -40,6 +42,36 @@ fun VaultNavHost(
         }
     }
 
+    // Register above the lock branch so results survive lock and activity recreation.
+    val saveBackupLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream")
+    ) { uri -> viewModel.completeExport(uri) }
+    val restoreBackupLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri -> viewModel.onImportFilePicked(uri) }
+
+    LaunchedEffect(uiState.exportReadyFileName, uiState.isUnlocked) {
+        if (!uiState.isUnlocked) return@LaunchedEffect
+        uiState.exportReadyFileName?.let { fileName ->
+            viewModel.consumeExportReadyFileName()
+            try {
+                saveBackupLauncher.launch(fileName)
+            } catch (_: Exception) {
+                viewModel.onBackupPickerLaunchFailed(export = true)
+            }
+        }
+    }
+
+    if (uiState.isUnlocked && uiState.hasPendingImport) {
+        BackupPasswordDialog(
+            export = false,
+            onDismiss = viewModel::discardPendingImport,
+            onConfirm = { password, legacy, skipDuplicates ->
+                viewModel.confirmPendingImport(password.toCharArray(), legacy, skipDuplicates)
+            }
+        )
+    }
+
     if (!uiState.isUnlocked) {
         UnlockScreen(viewModel = viewModel, uiState = uiState)
     } else {
@@ -64,10 +96,11 @@ fun VaultNavHost(
                 )
             }
 
-            composable(Screen.AddEntry.route) {
+            composable(Screen.AddEntry.route) { backStackEntry ->
                 AddEditEntryScreen(
                     entryId = null,
                     viewModel = viewModel,
+                    draftKey = backStackEntry.id,
                     onNavigateBack = { navController.popBackStack() }
                 )
             }
@@ -80,6 +113,7 @@ fun VaultNavHost(
                 AddEditEntryScreen(
                     entryId = entryId,
                     viewModel = viewModel,
+                    draftKey = backStackEntry.id,
                     onNavigateBack = { navController.popBackStack() }
                 )
             }
@@ -96,7 +130,16 @@ fun VaultNavHost(
                     viewModel = viewModel,
                     uiState = uiState,
                     onNavigateBack = { navController.popBackStack() },
-                    onWipeApp = onWipeApp
+                    onWipeApp = onWipeApp,
+                    onRestoreBackup = {
+                        if (viewModel.beginImportPicker()) {
+                            try {
+                                restoreBackupLauncher.launch("*/*")
+                            } catch (_: Exception) {
+                                viewModel.onBackupPickerLaunchFailed(export = false)
+                            }
+                        }
+                    }
                 )
             }
         }

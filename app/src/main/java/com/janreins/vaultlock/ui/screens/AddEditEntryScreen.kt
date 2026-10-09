@@ -1,5 +1,6 @@
 package com.janreins.vaultlock.ui.screens
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -77,22 +78,29 @@ import com.janreins.vaultlock.ui.theme.RedError
 fun AddEditEntryScreen(
     entryId: Long?,
     viewModel: VaultViewModel,
+    draftKey: String,
     onNavigateBack: () -> Unit
 ) {
     val isEdit = entryId != null && entryId > 0
     val uiState by viewModel.uiState.collectAsState()
     val existingEntry = uiState.allEntries.find { it.id == entryId }
-    var loadedEntryId by remember(entryId) { mutableStateOf<Long?>(null) }
-    var createdAt by remember(entryId) { mutableStateOf(System.currentTimeMillis()) }
+    val draft = remember(viewModel, draftKey) { viewModel.entryDraft(draftKey) }
+    var loadedEntryId by draft::loadedEntryId
+    var createdAt by draft::createdAt
+    var title by draft::title
+    var username by draft::username
+    var password by draft::password
+    var url by draft::url
+    var notes by draft::notes
+    var totpSecret by draft::totpSecret
+    var category by draft::category
+    var isFavorite by draft::isFavorite
 
-    var title by remember { mutableStateOf("") }
-    var username by remember { mutableStateOf("") }
-    var password by remember { mutableStateOf("") }
-    var url by remember { mutableStateOf("") }
-    var notes by remember { mutableStateOf("") }
-    var totpSecret by remember { mutableStateOf("") }
-    var category by remember { mutableStateOf("Login") }
-    var isFavorite by remember { mutableStateOf(false) }
+    val discardAndNavigateBack = {
+        viewModel.discardEntryDraft(draftKey)
+        onNavigateBack()
+    }
+    BackHandler(onBack = discardAndNavigateBack)
 
     var isPasswordVisible by remember { mutableStateOf(false) }
     var showGeneratorSheet by remember { mutableStateOf(false) }
@@ -133,7 +141,7 @@ fun AddEditEntryScreen(
                 },
                 navigationIcon = {
                     IconButton(
-                        onClick = onNavigateBack,
+                        onClick = discardAndNavigateBack,
                         modifier = Modifier.testTag("entry_back_btn")
                     ) {
                         Icon(
@@ -431,6 +439,7 @@ fun AddEditEntryScreen(
                             updatedAt = System.currentTimeMillis()
                         )
                         viewModel.saveEntry(entry) {
+                            viewModel.discardEntryDraft(draftKey)
                             onNavigateBack()
                         }
                     }

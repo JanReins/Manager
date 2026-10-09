@@ -63,8 +63,8 @@ class MainActivity : FragmentActivity() {
 
     override fun onStop() {
         super.onStop()
-        // Lock the vault immediately when backgrounded
-        viewModel.onAppBackgrounded()
+        // The ViewModel distinguishes recreation from a real background stop.
+        viewModel.onActivityStopped(isChangingConfigurations)
     }
 
     override fun onStart() {
